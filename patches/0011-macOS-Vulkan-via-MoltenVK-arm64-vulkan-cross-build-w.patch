@@ -1,0 +1,97 @@
+From 92b3b1b120c35bed867319b7f03fdf329a6ed6ea Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 20:50:56 +0100
+Subject: [PATCH 11/30] macOS: Vulkan via MoltenVK (arm64-vulkan cross-build,
+ weak-linked MoltenVK, laya-bench)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/laya_c.cpp             |  9 +++++++++
+ scripts/capi/build-macos.sh | 22 ++++++++++++++++++++--
+ 2 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index 2723f0f..0bab728 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -16,6 +16,9 @@
+ #include <new>
+ #include <string>
+ #include <thread>
++#if defined(__APPLE__)
++#include <dlfcn.h>
++#endif
+ #ifdef _WIN32
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+@@ -341,6 +344,12 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+         else if (backend_text == "cuda") backend = laya::backend_type::cuda;
+         else if (backend_text == "vulkan") {
+             backend = laya::backend_type::vulkan;
++#if defined(__APPLE__) && defined(LAYA_VULKAN)
++            // liblaya.dylib weak-links MoltenVK (Vulkan on Metal); without it the symbols are absent.
++            if (!dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr"))
++                throw std::runtime_error("Vulkan is not available: put libMoltenVK.dylib next to liblaya.dylib, "
++                                         "or use the cpu backend");
++#endif
+ #if defined(_WIN32) && defined(LAYA_VULKAN)
+             // laya.dll delay-loads vulkan-1.dll (installed with GPU drivers), so the library and the
+             // CPU backend work on machines without it; check before anything touches Vulkan.
+diff --git a/scripts/capi/build-macos.sh b/scripts/capi/build-macos.sh
+index bde7146..fbc4f21 100755
+--- a/scripts/capi/build-macos.sh
++++ b/scripts/capi/build-macos.sh
+@@ -56,6 +56,14 @@ for variant in $VARIANTS; do
+     arm64)         arch=arm64;  za=aarch64; isa=(-DCMAKE_C_FLAGS=-mcpu=apple_m1 "-DCMAKE_CXX_FLAGS=-mcpu=apple_m1 -DU_STATIC_IMPLEMENTATION") ;;
+     x86_64-avx2)   arch=x86_64; za=x86_64;  isa=(-DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON "-DCMAKE_CXX_FLAGS=-DU_STATIC_IMPLEMENTATION") ;;
+     x86_64-compat) arch=x86_64; za=x86_64;  isa=(-DGGML_SSE42=ON -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF "-DCMAKE_CXX_FLAGS=-DU_STATIC_IMPLEMENTATION") ;;
++    # GPU via Vulkan on Metal (MoltenVK, weak-linked: without libMoltenVK.dylib next to liblaya.dylib
++    # the cpu backend still works). Needs MOLTENVK=/path/to/libMoltenVK.dylib (official release),
++    # VULKAN_HEADERS=/path/to/Vulkan-Headers/include, GLSLC=glslc (shaderc >= 2025.3),
++    # SPIRV_HEADERS=/path/to/SPIRV-Headers/include.
++    arm64-vulkan)  arch=arm64;  za=aarch64; isa=(-DCMAKE_C_FLAGS=-mcpu=apple_m1
++                     "-DCMAKE_CXX_FLAGS=-mcpu=apple_m1 -DU_STATIC_IMPLEMENTATION -I${SPIRV_HEADERS:?set SPIRV_HEADERS}"
++                     -DLAYA_VULKAN=ON -DVulkan_INCLUDE_DIR="${VULKAN_HEADERS:?set VULKAN_HEADERS}"
++                     -DVulkan_LIBRARY="${MOLTENVK:?set MOLTENVK}" -DVulkan_GLSLC_EXECUTABLE="${GLSLC:-glslc}") ;;
+     *) echo "unknown variant $variant" >&2; exit 1 ;;
+   esac
+   icu_for $za
+@@ -69,7 +77,7 @@ for variant in $VARIANTS; do
+     -DICU_ROOT="$I" -DICU_INCLUDE_DIR="$I/include" -DICU_UC_LIBRARY_RELEASE="$I/lib/libicuuc.a" \
+     -DICU_I18N_LIBRARY_RELEASE="$I/lib/libicui18n.a" -DICU_DATA_LIBRARY_RELEASE="$I/lib/libicudata.a" \
+     -Dnlohmann_json_DIR="$WORK/nl/share/cmake/nlohmann_json"
+-  cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi
++  cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi laya-bench
+ 
+   # zig's Mach-O linker ignores -exported_symbols_list, so relink the dylib with LLVM's ld64.lld
+   # against the same libc++/compiler-rt that zig uses (found by letting zig link a probe).
+@@ -81,7 +89,14 @@ for variant in $VARIANTS; do
+     libdir=$("$ZIG" env | sed -n 's/.*\.lib_dir = "\(.*\)".*/\1/p')
+     ldarch=$([ $za = aarch64 ] && echo arm64 || echo x86_64)
+     inputs=$(sed -n 's/^  LINK_LIBRARIES = //p' <(sed -n '/^build bin\/liblaya.dylib/,/^$/p' "$B/build.ninja") | sed 's/ -lm//')
+-    (cd "$B" && "$LD64" -arch $ldarch -platform_version macos 11.0 11.0 -dylib -o bin/liblaya.dylib \
++    extra=""
++    if [ -n "${MOLTENVK:-}" ] && [[ $variant == *vulkan* ]]; then
++      # Weak link: dyld then loads liblaya.dylib even without MoltenVK (the cpu backend keeps working);
++      # @loader_path finds libMoltenVK.dylib when it is shipped next to liblaya.dylib.
++      inputs=$(printf '%s\n' $inputs | grep -v -F "$MOLTENVK" | tr '\n' ' ')
++      extra="-weak_library $MOLTENVK -rpath @loader_path"
++    fi
++    (cd "$B" && "$LD64" -arch $ldarch -platform_version macos 11.0 11.0 -dylib -o bin/liblaya.dylib $extra \
+        -install_name @rpath/liblaya.dylib -compatibility_version 1.0.0 -current_version 1.0.0 \
+        -exported_symbols_list "$ROOT/capi/macos-exports.txt" -dead_strip -x -adhoc_codesign \
+        capi/CMakeFiles/laya_c.dir/laya_c.cpp.o $inputs $rt -L"$libdir/libc/darwin" -lSystem)
+@@ -90,6 +105,9 @@ for variant in $VARIANTS; do
+     (cd "$B" && "$LD64" -arch $ldarch -platform_version macos 11.0 11.0 -execute -o bin/test-capi \
+        -rpath @executable_path -dead_strip -adhoc_codesign \
+        capi/CMakeFiles/test-capi.dir/__/tests/capi/test_capi.c.o bin/liblaya.dylib $crt -L"$libdir/libc/darwin" -lSystem)
++    (cd "$B" && "$LD64" -arch $ldarch -platform_version macos 11.0 11.0 -execute -o bin/laya-bench \
++       -rpath @executable_path -dead_strip -adhoc_codesign \
++       capi/CMakeFiles/laya-bench.dir/__/tests/capi/bench_capi.c.o bin/liblaya.dylib $crt -L"$libdir/libc/darwin" -lSystem)
+   else
+     echo "warning: ld64.lld not found; $variant dylib exports internal symbols too" >&2
+   fi
+-- 
+2.43.0
+

@@ -1,0 +1,81 @@
+From 4e575e8914c6883c536ed2cda9712a8c6ffe8c3e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 21:42:40 +0100
+Subject: [PATCH 17/30] 1.0.9: split FP32 Vulkan passes above 512 tokens on
+ macOS (MoltenVK out-of-bounds write)
+
+Traced on Apple M3 Ultra: correct up to 512 tokens per pass, wrong above; with tracing the
+answers are right but an already-used tensor is overwritten. LAYA_MAX_PASS_TOKENS overrides.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt |  2 +-
+ src/runtime.cpp     | 38 +++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index ec284d0..08fad69 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ # Flat C ABI shared library over laya.cpp: laya.dll (Windows), liblaya.so (Linux), liblaya.dylib (macOS).
+ # Enable from the top level with -DLAYA_C_API=ON. Build ggml statically (-DBUILD_SHARED_LIBS=OFF)
+ # to get a single self-contained library.
+-set(LAYA_C_VERSION "1.0.8" CACHE STRING "Version string reported by laya_version()")
++set(LAYA_C_VERSION "1.0.9" CACHE STRING "Version string reported by laya_version()")
+ 
+ add_library(laya_c SHARED laya_c.cpp)
+ target_include_directories(laya_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index 9845c18..6fc0373 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -732,7 +732,43 @@ runtime::runtime(const std::filesystem::path& path, backend_type selected, preci
+     p->load(path, selected);
+ }
+ runtime::~runtime() = default;
+-raw_result runtime::forward(const batch& input) { return p->run(input); }
++// Largest number of tokens (rows x padded length) evaluated in one pass, 0 = unlimited.
++// Vulkan on Metal (MoltenVK) computes FP32 batches wrongly once a pass exceeds 512 tokens: beyond
++// 524288 elements ggml's element-wise dispatch gains a third slab and writes outside its tensor
++// (seen on Apple M3 Ultra; single sequences, which never exceed 512 tokens, and the FP16/BF16
++// kernels are unaffected). Rows are independent, so splitting the batch gives the same results.
++// LAYA_MAX_PASS_TOKENS overrides the limit for any backend (0 disables it).
++static int pass_token_limit(bool vulkan, bool low_precision) {
++    if (const char* text = std::getenv("LAYA_MAX_PASS_TOKENS")) return std::max(0, std::atoi(text));
++#ifdef __APPLE__
++    if (vulkan && !low_precision) return 512;
++#endif
++    (void)vulkan; (void)low_precision;
++    return 0;
++}
++raw_result runtime::forward(const batch& input) {
++    const int limit = pass_token_limit(p->vulkan, p->low_precision);
++    const int rows = limit > 0 && input.length > 0 ? std::max(1, limit / input.length) : input.size;
++    if (rows >= input.size) return p->run(input);
++    raw_result result;
++    for (int first = 0; first < input.size; first += rows) {
++        const int count = std::min(rows, input.size - first);
++        batch part;
++        part.size = count; part.length = input.length; part.options = input.options;
++        part.ids.assign(input.ids.begin() + size_t(first) * input.length, input.ids.begin() + size_t(first + count) * input.length);
++        part.lengths.assign(input.lengths.begin() + first, input.lengths.begin() + first + count);
++        part.counts.assign(input.counts.begin() + first, input.counts.begin() + first + count);
++        part.types.assign(input.types.begin() + first, input.types.begin() + first + count);
++        part.markers.assign(input.markers.begin() + size_t(first) * input.options, input.markers.begin() + size_t(first + count) * input.options);
++        for (auto& marker : part.markers) marker -= first * input.length;  // markers are batch-absolute token indices
++        auto piece = p->run(part);
++        result.logits.insert(result.logits.end(), piece.logits.begin(), piece.logits.end());
++        result.actions.insert(result.actions.end(), piece.actions.begin(), piece.actions.end());
++        result.action_count = piece.action_count;
++        result.compute_ms += piece.compute_ms;
++    }
++    return result;
++}
+ const json& runtime::config() const { return p->config; }
+ std::string runtime::backend_name() const {
+ #ifdef LAYA_COREML
+-- 
+2.43.0
+

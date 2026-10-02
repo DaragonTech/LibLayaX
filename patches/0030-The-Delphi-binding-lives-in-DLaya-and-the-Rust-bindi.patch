@@ -1,0 +1,52 @@
+From a27391b5b93206d581cc3d5570cecacee73f3ccb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 2 Oct 2026 14:57:14 +0100
+Subject: [PATCH 30/30] The Delphi binding lives in DLaya and the Rust binding
+ in RLaya; this tree no longer carries them
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ .github/workflows/capi-windows.yml | 2 +-
+ capi/README.md                     | 8 ++++++--
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/.github/workflows/capi-windows.yml b/.github/workflows/capi-windows.yml
+index 465df09..476c2e7 100644
+--- a/.github/workflows/capi-windows.yml
++++ b/.github/workflows/capi-windows.yml
+@@ -109,7 +109,7 @@ jobs:
+         run: |
+           $out = "dist/laya-dll-windows-x64-${{ matrix.variant }}"
+           New-Item -ItemType Directory -Force $out | Out-Null
+-          Copy-Item build/bin/laya.dll, capi/laya_c.h, delphi/Laya.pas, delphi/LayaTests.dpr, capi/README.md $out
++          Copy-Item build/bin/laya.dll, capi/laya_c.h, capi/laya.def, capi/README.md $out
+           if ('${{ matrix.variant }}' -eq 'cuda12') {
+             # cuBLAS is linked dynamically on Windows (CUDA EULA permits redistribution of these DLLs).
+             Copy-Item "$env:CUDA_PATH/bin/cublas64_12.dll", "$env:CUDA_PATH/bin/cublasLt64_12.dll" $out
+diff --git a/capi/README.md b/capi/README.md
+index c02f7e2..d2708a6 100644
+--- a/capi/README.md
++++ b/capi/README.md
+@@ -1,4 +1,6 @@
+-# laya.dll — C API for laya.cpp
++# LibLayaX: the C API
++
++This is the API reference of LibLayaX (`laya.dll` / `liblaya.so` / `liblaya.dylib`).
+ 
+ A flat C ABI around [laya.cpp](https://github.com/lkarlslund/laya.cpp) so Laya typed-decision
+ inference can be called in-process from Delphi, C#, Python (ctypes) or anything else that can
+@@ -130,7 +132,9 @@ on real hardware (Windows 11 on ARM under Parallels, Apple M3 Ultra):
+   library relies on (atomics, thread-local storage, FP environment, the engine's start-up
+   arithmetic, call_once, mutexes, exceptions, threads). No library, no model; each step is
+   announced before it runs.
+-* `delphi/LayaTests.dpr`: the same kind of tests through the Delphi binding.
++* The language bindings are separate projects with their own tests: DLaya (Delphi and Free
++  Pascal) and RLaya (Rust). `run-tests.bat` also runs DLaya's `LayaTests.exe` when it is placed
++  next to the DLL.
+ 
+ ## Credits
+ 
+-- 
+2.43.0
+

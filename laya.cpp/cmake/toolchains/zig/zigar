@@ -1,0 +1,3 @@
+#!/bin/sh
+ZIG=${ZIG:-$(command -v zig || python3 -c "import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),'zig'))")}
+exec "$ZIG" ar "$@"

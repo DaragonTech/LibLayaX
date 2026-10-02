@@ -1,0 +1,212 @@
+From a85dd9d9e8eafba36608ed531cbd10f240104bc3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 18:20:45 +0100
+Subject: [PATCH 05/30] capi 1.0.4: mask FP exceptions on worker threads
+ started during a call; report all fatal exception codes; test step output
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/laya_c.cpp        | 56 +++++++++++++++++++++++++++++++++---------
+ tests/capi/test_capi.c | 10 ++++++++
+ 2 files changed, 55 insertions(+), 11 deletions(-)
+
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index f0054d4..5693656 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -55,6 +55,26 @@ thread_local std::string last_error;
+ // default, which is masked (Windows).
+ // feholdexcept covers x87 everywhere, but MinGW's version leaves the SSE control register (MXCSR)
+ // unmasked, and SSE is what ggml uses on x86-64, so MXCSR is handled explicitly.
++// Number of laya calls currently in progress (any thread). Threads that start while it is
++// non-zero are ggml workers spawned for that call; they get FP exceptions masked too (DllMain).
++std::atomic<int> calls_in_progress{0};
++
++inline void mask_fp_exceptions_on_this_thread() {
++#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
++    unsigned short cw;
++    unsigned int csr;
++    __asm__ volatile("fnstcw %0" : "=m"(cw));
++    __asm__ volatile("stmxcsr %0" : "=m"(csr));
++    cw |= 0x3F;
++    csr = (csr | 0x1F80u) & ~0x3Fu;
++    __asm__ volatile("fnclex");
++    __asm__ volatile("fldcw %0" : : "m"(cw));
++    __asm__ volatile("ldmxcsr %0" : : "m"(csr));
++#elif defined(_M_X64)
++    _mm_setcsr((_mm_getcsr() | 0x1F80u) & ~0x3Fu);
++#endif
++}
++
+ struct fp_guard {
+ #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+     // Save and restore the control registers directly rather than through <cfenv> (MinGW's fenv
+@@ -89,6 +109,13 @@ struct fp_guard {
+     fp_guard(const fp_guard&) = delete;
+     fp_guard& operator=(const fp_guard&) = delete;
+ };
++// Entry-point guard: masks FP exceptions for the call (fp_guard) and marks the call as in
++// progress so worker threads created meanwhile are masked as well.
++struct call_guard {
++    fp_guard fp;
++    call_guard() { ++calls_in_progress; }
++    ~call_guard() { --calls_in_progress; }
++};
+ 
+ // Logging: one process-wide sink shared by the library and ggml.
+ std::mutex log_lock;
+@@ -180,12 +207,10 @@ void describe_address(char* out, size_t size, void* address) {
+ }
+ LONG CALLBACK crash_reporter(EXCEPTION_POINTERS* info) {
+     const DWORD code = info->ExceptionRecord->ExceptionCode;
+-    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+-        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+-        code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_IN_PAGE_ERROR &&
+-        code != EXCEPTION_DATATYPE_MISALIGNMENT && code != STATUS_FLOAT_INVALID_OPERATION &&
+-        code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED)
+-        return EXCEPTION_CONTINUE_SEARCH;
++    // Every error-severity code (access violations, illegal instructions, x87 and SSE
++    // floating-point traps such as 0xC00002B4/0xC00002B5, stack overflow, fail-fast, ...),
++    // but not C++ exceptions, which are thrown and caught as part of normal error handling.
++    if ((code & 0xF0000000u) != 0xC0000000u) return EXCEPTION_CONTINUE_SEARCH;
+     static std::atomic<int> reported{0};
+     if (reported++ > 2) return EXCEPTION_CONTINUE_SEARCH;
+     char where[512], line[640];
+@@ -251,6 +276,15 @@ laya::json parse_requests(const char* text) {
+ std::string describe(const std::exception& e) { return e.what(); }
+ }  // namespace
+ 
++#ifdef _WIN32
++extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
++    // ggml starts its worker threads inside our calls. Whatever FP state a new thread starts
++    // with (an x64 emulator may hand it the host's unmasked state), mask exceptions on it.
++    if (reason == DLL_THREAD_ATTACH && calls_in_progress.load() > 0) mask_fp_exceptions_on_this_thread();
++    return TRUE;
++}
++#endif
++
+ extern "C" {
+ 
+ LAYA_API const char* LAYA_CALL laya_version(void) {
+@@ -277,7 +311,7 @@ LAYA_API void LAYA_CALL laya_set_log_callback(laya_log_fn fn, void* user, int mi
+ }
+ 
+ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* options_json) {
+-    fp_guard fp;
++    call_guard fp;
+     last_error.clear();
+     install_hooks();
+     try {
+@@ -352,7 +386,7 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+ }
+ 
+ LAYA_API char* LAYA_CALL laya_predict(laya_agent* agent, const char* request_json) {
+-    fp_guard fp;
++    call_guard fp;
+     last_error.clear();
+     try {
+         if (!agent) throw std::invalid_argument("agent is NULL");
+@@ -374,7 +408,7 @@ LAYA_API char* LAYA_CALL laya_predict(laya_agent* agent, const char* request_jso
+ }
+ 
+ LAYA_API char* LAYA_CALL laya_prepare(laya_agent* agent, const char* request_json) {
+-    fp_guard fp;
++    call_guard fp;
+     last_error.clear();
+     try {
+         if (!agent) throw std::invalid_argument("agent is NULL");
+@@ -389,7 +423,7 @@ LAYA_API char* LAYA_CALL laya_prepare(laya_agent* agent, const char* request_jso
+ }
+ 
+ LAYA_API char* LAYA_CALL laya_info(laya_agent* agent) {
+-    fp_guard fp;
++    call_guard fp;
+     last_error.clear();
+     try {
+         if (!agent) throw std::invalid_argument("agent is NULL");
+@@ -406,7 +440,7 @@ LAYA_API char* LAYA_CALL laya_info(laya_agent* agent) {
+ LAYA_API void LAYA_CALL laya_free_string(char* text) { std::free(text); }
+ 
+ LAYA_API void LAYA_CALL laya_destroy(laya_agent* agent) {
+-    fp_guard fp;
++    call_guard fp;
+     try { delete agent; } catch (...) {}
+ }
+ 
+diff --git a/tests/capi/test_capi.c b/tests/capi/test_capi.c
+index f244a0c..145040b 100644
+--- a/tests/capi/test_capi.c
++++ b/tests/capi/test_capi.c
+@@ -85,6 +85,8 @@ static int failures = 0, checks = 0;
+         }                                                                      \
+     } while (0)
+ 
++#define STEP(name) do { printf("[step] %s\n", name); fflush(stdout); } while (0)
++
+ static int contains(const char* text, const char* needle) { return text && strstr(text, needle) != NULL; }
+ static int is_error(const char* json) { return json && strncmp(json, "{\"error\":", 9) == 0; }
+ 
+@@ -203,6 +205,7 @@ static void test_model(const char* model, const char* backend, const char* dump_
+     printf("info: %s\n", info ? info : "(null)");
+     laya_free_string(info);
+ 
++    STEP("single yes/no question");
+     /* single boolean question */
+     char* full = laya_predict(agent, REQ_NOUL);
+     CHECK(full && !is_error(full), "noul: %s", full ? full : "(null)");
+@@ -211,6 +214,7 @@ static void test_model(const char* model, const char* backend, const char* dump_
+     printf("noul: %s\n", full ? full : "(null)");
+     laya_free_string(full);
+ 
++    STEP("batch: choice + score + noul, padded");
+     /* batch of two requests, choice + score + noul with criteria, nested JSON state, UTF-8 */
+     char* reference = predict_results(agent, REQ_BATCH);
+     CHECK(reference != NULL, "batch failed");
+@@ -222,16 +226,19 @@ static void test_model(const char* model, const char* backend, const char* dump_
+         CHECK(second && contains(second, "\"refund\""), "second request answered: %s", reference);
+     }
+ 
++    STEP("determinism");
+     /* determinism: same input, same output */
+     char* again = predict_results(agent, REQ_BATCH);
+     CHECK(reference && again && strcmp(reference, again) == 0, "nondeterministic:\n%s\n%s", reference ? reference : "(null)", again ? again : "(null)");
+     free(again);
+ 
++    STEP("prepare");
+     /* prepare */
+     char* prep = laya_prepare(agent, REQ_NOUL);
+     CHECK(prep && contains(prep, "\"ids\":[") && contains(prep, "\"batch\":1"), "prepare: %.200s", prep ? prep : "(null)");
+     laya_free_string(prep);
+ 
++    STEP("malformed requests");
+     /* bad requests produce {"error":...} and leave the agent usable */
+     const char* bad_requests[][2] = {
+         {"{oops", "parse"},
+@@ -252,6 +259,7 @@ static void test_model(const char* model, const char* backend, const char* dump_
+         laya_free_string(r);
+     }
+ 
++    STEP("over-long state");
+     /* over-long state is rejected (no silent truncation) */
+     {
+         size_t n = 20000;
+@@ -269,6 +277,7 @@ static void test_model(const char* model, const char* backend, const char* dump_
+     CHECK(reference && after && strcmp(reference, after) == 0, "agent changed after errors");
+     free(after);
+ 
++    STEP("4 threads share one agent");
+     /* concurrency: four threads share one agent; every answer must equal the reference */
+     if (reference) {
+         enum { N = 4 };
+@@ -291,6 +300,7 @@ static void test_model(const char* model, const char* backend, const char* dump_
+     free(reference);
+     laya_destroy(agent);
+ 
++    STEP("destroy + reload");
+     /* reload after destroy, with explicit thread count and the variant option */
+     snprintf(options, sizeof options, "{\"backend\":\"%s\",\"threads\":1,\"variant\":\"english\"}", backend);
+     agent = laya_create(model, options);
+-- 
+2.43.0
+

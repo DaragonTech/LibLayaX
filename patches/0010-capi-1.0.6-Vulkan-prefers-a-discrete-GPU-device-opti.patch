@@ -1,0 +1,177 @@
+From 6675707570d1d403046b510b81f7281be9f3db66 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 20:36:20 +0100
+Subject: [PATCH 10/30] capi 1.0.6: Vulkan prefers a discrete GPU; "device"
+ option (index or name part)
+
+Laptops list the integrated GPU first, so index 0 picked Intel Graphics instead of the RTX.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt      |  2 +-
+ capi/laya_c.cpp          | 13 ++++++++++++-
+ capi/laya_c.h            |  2 ++
+ include/laya/runtime.hpp |  4 ++++
+ src/runtime.cpp          | 38 ++++++++++++++++++++++++++++++++++++--
+ 5 files changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index 39c18f4..2dca034 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ # Flat C ABI shared library over laya.cpp: laya.dll (Windows), liblaya.so (Linux), liblaya.dylib (macOS).
+ # Enable from the top level with -DLAYA_C_API=ON. Build ggml statically (-DBUILD_SHARED_LIBS=OFF)
+ # to get a single self-contained library.
+-set(LAYA_C_VERSION "1.0.2" CACHE STRING "Version string reported by laya_version()")
++set(LAYA_C_VERSION "1.0.6" CACHE STRING "Version string reported by laya_version()")
+ 
+ add_library(laya_c SHARED laya_c.cpp)
+ target_include_directories(laya_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index 833c2af..2723f0f 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -332,7 +332,7 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+         if (!options.is_object()) throw std::invalid_argument("options_json must be a JSON object");
+         for (auto& [key, unused] : options.items())
+             if (key != "backend" && key != "variant" && key != "precision" && key != "flash" &&
+-                key != "tensor_core" && key != "allow_truncation" && key != "threads")
++                key != "tensor_core" && key != "allow_truncation" && key != "threads" && key != "device")
+                 throw std::invalid_argument("Unknown option: " + key);
+ 
+         const std::string backend_text = options.value("backend", "cpu");
+@@ -369,6 +369,13 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+              !std::filesystem::exists(directory / "rl_agent_config.json")))
+             directory /= variant;
+ 
++        std::string device;
++        if (options.contains("device")) {
++            const auto& d = options.at("device");
++            if (d.is_number_integer() && d.get<int>() >= 0) device = std::to_string(d.get<int>());
++            else if (d.is_string()) device = d.get<std::string>();
++            else throw std::invalid_argument("device must be a GPU index (0, 1, ...) or part of its name");
++        }
+         const int threads = options.value("threads", 0);
+         if (threads < 0 || threads > 1024) throw std::invalid_argument("threads must be 0..1024");
+         const bool flash = options.value("flash", precision != laya::precision_type::fp32);
+@@ -382,9 +389,11 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+         static std::mutex create_lock;  // set_cpu_threads is process-wide; keep creation atomic
+         std::lock_guard<std::mutex> guard(create_lock);
+         laya::set_cpu_threads(threads ? threads : int(std::max(1u, std::thread::hardware_concurrency())));
++        laya::set_gpu_device(device);
+         auto* agent = new laya_agent{laya::agent(directory, backend, precision, flash, tensor_core, allow_truncation),
+                                      {}, path_utf8(directory), {}, {}};
+         laya::set_cpu_threads(0);
++        laya::set_gpu_device("");
+ 
+         std::ifstream config_file(directory / "rl_agent_config.json");
+         const auto config = laya::json::parse(config_file, nullptr, false);
+@@ -398,9 +407,11 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+         return agent;
+     } catch (const std::exception& e) {
+         laya::set_cpu_threads(0);
++        laya::set_gpu_device("");
+         set_last_error(describe(e));
+     } catch (...) {
+         laya::set_cpu_threads(0);
++        laya::set_gpu_device("");
+         set_last_error("Unknown failure while loading the model");
+     }
+     return nullptr;
+diff --git a/capi/laya_c.h b/capi/laya_c.h
+index d447aff..820066f 100644
+--- a/capi/laya_c.h
++++ b/capi/laya_c.h
+@@ -59,6 +59,8 @@ LAYA_API void LAYA_CALL laya_set_log_callback(laya_log_fn fn, void* user, int mi
+  *   "flash": bool, "tensor_core": bool   (CUDA fast path: both true)
+  *   "allow_truncation": bool             (default false: over-long requests are rejected)
+  *   "threads": int                       (CPU backend worker threads; default = all cores)
++ *   "device": int | "name part"          (Vulkan GPU: index, or part of its name such as "RTX";
++ *                                         default = first discrete GPU, else the first GPU)
+  * Returns NULL on failure; call laya_last_error() for the reason. */
+ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir_utf8, const char* options_json);
+ 
+diff --git a/include/laya/runtime.hpp b/include/laya/runtime.hpp
+index 0c2b25b..a4f8a0c 100644
+--- a/include/laya/runtime.hpp
++++ b/include/laya/runtime.hpp
+@@ -12,6 +12,10 @@ using json = nlohmann::ordered_json;
+ // CPU backend worker threads for runtimes created afterwards; 0 keeps the ggml default.
+ void set_cpu_threads(int count);
+ int cpu_threads();
++// Vulkan GPU for runtimes created afterwards: "" = first discrete GPU (else the first one),
++// a number = that device index, other text = first device whose name contains it.
++void set_gpu_device(const std::string& selector);
++std::string gpu_device();
+ struct batch {
+     int size = 0, length = 0, options = 0;
+     std::vector<int32_t> ids, lengths, markers, counts, types;
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index 300d281..008dfcb 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -22,6 +22,8 @@ const char* laya_cuda_bf16_compatibility_error();
+ #endif
+ #include <algorithm>
+ #include <atomic>
++#include <cctype>
++#include <mutex>
+ #include <chrono>
+ #include <cmath>
+ #include <cstring>
+@@ -36,6 +38,9 @@ namespace laya {
+ namespace { std::atomic<int> cpu_thread_count{0}; }
+ void set_cpu_threads(int count) { cpu_thread_count = count > 0 ? count : 0; }
+ int cpu_threads() { return cpu_thread_count; }
++namespace { std::mutex gpu_selector_lock; std::string gpu_selector_value; }
++void set_gpu_device(const std::string& selector) { std::lock_guard<std::mutex> g(gpu_selector_lock); gpu_selector_value = selector; }
++std::string gpu_device() { std::lock_guard<std::mutex> g(gpu_selector_lock); return gpu_selector_value; }
+ 
+ namespace {
+ using tensor = ggml_tensor;
+@@ -143,9 +148,38 @@ struct runtime::impl {
+         if (vulkan) {
+             // ggml asserts (aborting the whole process) when asked for a device that does not
+             // exist, so report a missing GPU as an ordinary error instead.
+-            if (ggml_backend_vk_get_device_count() < 1)
++            const int count = ggml_backend_vk_get_device_count();
++            if (count < 1)
+                 throw std::runtime_error("No usable Vulkan GPU found (GGML_VK_VISIBLE_DEVICES can select one)");
+-            backend = ggml_backend_vk_init(0);
++            // Device choice: an index, part of the GPU name (case-insensitive), or by default the
++            // first discrete GPU, falling back to the first device. ggml lists integrated GPUs in
++            // driver order, which on laptops often puts the slow built-in GPU first.
++            auto description = [](int i) {
++                char text[256] = {};
++                ggml_backend_vk_get_device_description(i, text, sizeof text);
++                return std::string(text);
++            };
++            auto lower = [](std::string t) { for (auto& c : t) c = char(std::tolower((unsigned char)c)); return t; };
++            const std::string selector = gpu_device();
++            int chosen = -1;
++            if (!selector.empty() && std::all_of(selector.begin(), selector.end(), [](unsigned char c) { return std::isdigit(c); })) {
++                chosen = std::stoi(selector);
++                if (chosen >= count) throw std::runtime_error("Vulkan device " + selector + " does not exist (" + std::to_string(count) + " found)");
++            } else if (!selector.empty()) {
++                for (int i = 0; i < count && chosen < 0; ++i)
++                    if (lower(description(i)).find(lower(selector)) != std::string::npos) chosen = i;
++                if (chosen < 0) {
++                    std::string names;
++                    for (int i = 0; i < count; ++i) names += (i ? ", " : "") + std::to_string(i) + ": " + description(i);
++                    throw std::runtime_error("No Vulkan GPU matches \"" + selector + "\" (found " + names + ")");
++                }
++            } else {
++                auto reg = ggml_backend_vk_reg();
++                for (int i = 0; i < count && chosen < 0 && size_t(i) < ggml_backend_reg_dev_count(reg); ++i)
++                    if (ggml_backend_dev_type(ggml_backend_reg_dev_get(reg, i)) == GGML_BACKEND_DEVICE_TYPE_GPU) chosen = i;
++                if (chosen < 0) chosen = 0;
++            }
++            backend = ggml_backend_vk_init(size_t(chosen));
+         }
+ #else
+         if (vulkan) throw std::runtime_error("This build has no Vulkan backend");
+-- 
+2.43.0
+

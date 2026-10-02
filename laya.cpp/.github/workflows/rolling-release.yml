@@ -1,0 +1,132 @@
+name: Rolling release
+
+on:
+  schedule:
+    - cron: '17 0,12 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Build and check binaries, or also publish a rolling prerelease
+        type: choice
+        default: validate
+        options: [validate, release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rolling-release-${{ inputs.mode == 'validate' && 'validation' || 'publication' }}
+  cancel-in-progress: ${{ inputs.mode == 'validate' }}
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.gate.outputs.build }}
+      tag: ${{ steps.gate.outputs.tag }}
+      commit: ${{ steps.gate.outputs.commit }}
+      previous: ${{ steps.gate.outputs.previous }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_MODE: ${{ inputs.mode || 'release' }}
+        run: python scripts/release/automation.py gate --mode "$RELEASE_MODE"
+
+  linux_cuda12:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    uses: ./.github/workflows/binary-build.yml
+    with:
+      target: linux-cuda12
+      commit: ${{ needs.gate.outputs.commit }}
+      tag: ${{ needs.gate.outputs.tag }}
+
+  linux_cuda13:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    uses: ./.github/workflows/binary-build.yml
+    with:
+      target: linux-cuda13
+      commit: ${{ needs.gate.outputs.commit }}
+      tag: ${{ needs.gate.outputs.tag }}
+
+  linux_vulkan:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    uses: ./.github/workflows/binary-build.yml
+    with:
+      target: linux-vulkan
+      commit: ${{ needs.gate.outputs.commit }}
+      tag: ${{ needs.gate.outputs.tag }}
+
+  windows_cuda12:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    uses: ./.github/workflows/binary-build.yml
+    with:
+      target: windows-cuda12
+      commit: ${{ needs.gate.outputs.commit }}
+      tag: ${{ needs.gate.outputs.tag }}
+
+  windows_cuda13:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    uses: ./.github/workflows/binary-build.yml
+    with:
+      target: windows-cuda13
+      commit: ${{ needs.gate.outputs.commit }}
+      tag: ${{ needs.gate.outputs.tag }}
+
+  windows_vulkan:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    uses: ./.github/workflows/binary-build.yml
+    with:
+      target: windows-vulkan
+      commit: ${{ needs.gate.outputs.commit }}
+      tag: ${{ needs.gate.outputs.tag }}
+
+  macos_coreml:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    uses: ./.github/workflows/binary-build.yml
+    with:
+      target: macos-coreml
+      commit: ${{ needs.gate.outputs.commit }}
+      tag: ${{ needs.gate.outputs.tag }}
+
+  publish:
+    needs: [gate, linux_cuda12, linux_cuda13, linux_vulkan, windows_cuda12, windows_cuda13, windows_vulkan, macos_coreml]
+    if: needs.linux_cuda12.result == 'success' && needs.linux_cuda13.result == 'success' && needs.linux_vulkan.result == 'success' && needs.windows_cuda12.result == 'success' && needs.windows_cuda13.result == 'success' && needs.windows_vulkan.result == 'success' && needs.macos_coreml.result == 'success' && (github.event_name == 'schedule' || inputs.mode == 'release')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.commit }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Verify complete set and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.gate.outputs.commit }}
+          PREVIOUS_TAG: ${{ needs.gate.outputs.previous }}
+        run: |
+          chmod +x dist/laya-*-linux-amd64-* dist/laya-*-macos-arm64-*
+          python scripts/release/automation.py publish --output dist --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --previous "$PREVIOUS_TAG"

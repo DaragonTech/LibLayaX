@@ -1,0 +1,68 @@
+#pragma once
+#include <filesystem>
+#include <memory>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <vector>
+
+namespace laya {
+enum class backend_type { cuda, cpu, vulkan, coreml };
+enum class precision_type { fp32, fp16, bf16 };
+using json = nlohmann::ordered_json;
+// CPU backend worker threads for runtimes created afterwards; 0 keeps the ggml default.
+void set_cpu_threads(int count);
+int cpu_threads();
+// Vulkan GPU for runtimes created afterwards: "" = first discrete GPU (else the first one),
+// a number = that device index, other text = first device whose name contains it.
+void set_gpu_device(const std::string& selector);
+std::string gpu_device();
+struct batch {
+    int size = 0, length = 0, options = 0;
+    std::vector<int32_t> ids, lengths, markers, counts, types;
+};
+struct raw_result {
+    std::vector<float> logits, actions;
+    int action_count = 0;
+    double compute_ms = 0;
+};
+class tokenizer {
+public:
+    explicit tokenizer(const std::filesystem::path& path);
+    ~tokenizer();
+    std::vector<int32_t> encode(const std::string& text) const;
+    int32_t token_id(const std::string& text) const;
+private:
+    struct impl;
+    std::unique_ptr<impl> p;
+};
+class runtime {
+public:
+    runtime(const std::filesystem::path& directory, bool cuda = true, bool bf16 = false, bool flash = false, bool tensor_core = false);
+    runtime(const std::filesystem::path& directory, backend_type backend, bool bf16 = false, bool flash = false, bool tensor_core = false);
+    runtime(const std::filesystem::path& directory, backend_type backend, precision_type precision, bool flash = false, bool tensor_core = false);
+    ~runtime();
+    raw_result forward(const batch& input);
+    const json& config() const;
+    std::string backend_name() const;
+    std::string device_name() const;
+private:
+    struct impl;
+    std::unique_ptr<impl> p;
+};
+class agent {
+public:
+    agent(const std::filesystem::path& directory, bool cuda = true, bool bf16 = false, bool flash = false, bool tensor_core = false, bool allow_truncation = false);
+    agent(const std::filesystem::path& directory, backend_type backend, bool bf16 = false, bool flash = false, bool tensor_core = false, bool allow_truncation = false);
+    agent(const std::filesystem::path& directory, backend_type backend, precision_type precision, bool flash = false, bool tensor_core = false, bool allow_truncation = false);
+    json predict(const json& requests, bool raw = false);
+    json prepare_json(const json& requests) const;
+    std::string backend_name() const;
+    std::string device_name() const;
+private:
+    runtime model;
+    tokenizer tok;
+    bool allow_truncation;
+    json settings;
+    batch prepare(const json& requests, json& metadata) const;
+};
+}

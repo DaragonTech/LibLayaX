@@ -1,0 +1,121 @@
+From 7a56e1cba7846d9445966f6b41600740e5824cb3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 21:02:41 +0100
+Subject: [PATCH 12/30] Mac Vulkan 1.0.7: finite FP32 attention masks on
+ MoltenVK; tests compare GPU answers with CPU
+
+FP32 / tensor_core batches gave near-uniform answers on Apple M3 Ultra via MoltenVK while FP16/BF16
+were correct. ggml optimisation switches and MoltenVK fast math ruled out. LAYA_VK_MASK=inf restores
+the old masks for comparison.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt    |  2 +-
+ src/runtime.cpp        | 16 +++++++++++++---
+ tests/capi/test_capi.c | 37 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index 2dca034..ffe7a26 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ # Flat C ABI shared library over laya.cpp: laya.dll (Windows), liblaya.so (Linux), liblaya.dylib (macOS).
+ # Enable from the top level with -DLAYA_C_API=ON. Build ggml statically (-DBUILD_SHARED_LIBS=OFF)
+ # to get a single self-contained library.
+-set(LAYA_C_VERSION "1.0.6" CACHE STRING "Version string reported by laya_version()")
++set(LAYA_C_VERSION "1.0.7" CACHE STRING "Version string reported by laya_version()")
+ 
+ add_library(laya_c SHARED laya_c.cpp)
+ target_include_directories(laya_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index 008dfcb..9923ec8 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -636,14 +636,24 @@ struct runtime::impl {
+         put(s.types, types); put(s.cls, cls);
+         if (vulkan) {
+             const int mask_rows = s.global_mask->ne[1];
+-            std::vector<float> global(size_t(s.length)*mask_rows*s.batch, -INFINITY), local(global.size(), -INFINITY);
++#ifdef __APPLE__
++            // Vulkan on Metal (MoltenVK) mishandles -inf in the FP32 masked softmax: padded batches
++            // came out near-uniform. A huge finite value gives the same result (exp underflows to 0)
++            // and still converts to -inf for the FP16 masks below.
++            // LAYA_VK_MASK=inf restores -inf (for comparison).
++            const char* mask_mode = std::getenv("LAYA_VK_MASK");
++            const float masked = mask_mode && std::strcmp(mask_mode, "inf") == 0 ? -INFINITY : -1e30f;
++#else
++            constexpr float masked = -INFINITY;
++#endif
++            std::vector<float> global(size_t(s.length)*mask_rows*s.batch, masked), local(global.size(), masked);
+             for (int row = 0; row < s.batch; ++row)
+                 for (int query = 0; query < s.length; ++query)
+                     for (int key = 0; key < s.length; ++key) {
+                         const size_t index = (size_t(row)*mask_rows + query)*s.length + key;
+-                        global[index] = key < input.lengths[row] ? 0.f : -INFINITY;
++                        global[index] = key < input.lengths[row] ? 0.f : masked;
+                         local[index] = ((key < input.lengths[row] && std::abs(query-key) <= 64) ||
+-                            (query >= input.lengths[row]+64 && key == 0)) ? 0.f : -INFINITY;
++                            (query >= input.lengths[row]+64 && key == 0)) ? 0.f : masked;
+                     }
+             if (flash) {
+                 std::vector<ggml_fp16_t> global_half(global.size()), local_half(local.size());
+diff --git a/tests/capi/test_capi.c b/tests/capi/test_capi.c
+index 8b03031..2c1ed8c 100644
+--- a/tests/capi/test_capi.c
++++ b/tests/capi/test_capi.c
+@@ -129,6 +129,29 @@ static char* predict_results(laya_agent* agent, const char* request) {
+     return results;
+ }
+ 
++
++/* Compare two JSON texts that have the same structure: every number must agree within tol.
++ * Used to check a GPU backend against the CPU (GPUs round differently in the last digits). */
++static int same_numbers(const char* a, const char* b, double tol, double* worst) {
++    *worst = 0;
++    while (*a && *b) {
++        int na = (*a == '-' || (*a >= '0' && *a <= '9')), nb = (*b == '-' || (*b >= '0' && *b <= '9'));
++        if (na && nb) {
++            char *ea, *eb;
++            double x = strtod(a, &ea), y = strtod(b, &eb);
++            double d = x > y ? x - y : y - x;
++            if (d > *worst) *worst = d;
++            if (d > tol) return 0;
++            a = ea; b = eb;
++        } else if (na != nb || *a != *b) {
++            return 0;
++        } else {
++            ++a; ++b;
++        }
++    }
++    return *a == *b;
++}
++
+ /* ---------------------------------------------------------------- contract tests (no model) */
+ 
+ static int log_calls = 0;
+@@ -245,6 +268,20 @@ static void test_model(const char* model, const char* backend, const char* dump_
+         CHECK(second && contains(second, "\"refund\""), "second request answered: %s", reference);
+     }
+ 
++    /* a GPU backend must give the CPU's answers (catches miscompiled shaders, e.g. fast math) */
++    if (reference && strcmp(backend, "cpu") != 0) {
++        STEP("answers match the cpu backend");
++        laya_agent* cpu = laya_create(model, "{\"backend\":\"cpu\"}");
++        CHECK(cpu != NULL, "cpu create: %s", laya_last_error());
++        char* expected = cpu ? predict_results(cpu, REQ_BATCH) : NULL;
++        double worst = 0;
++        int same = expected && same_numbers(reference, expected, 0.02, &worst);
++        CHECK(same, "%s answers differ from cpu (largest difference %.4f):\n  %s\n  cpu: %s", backend, worst,
++              reference, expected ? expected : "(null)");
++        if (same) printf("largest difference from cpu: %.4f\n", worst);
++        free(expected);
++        laya_destroy(cpu);
++    }
+     STEP("determinism");
+     /* determinism: same input, same output */
+     char* again = predict_results(agent, REQ_BATCH);
+-- 
+2.43.0
+

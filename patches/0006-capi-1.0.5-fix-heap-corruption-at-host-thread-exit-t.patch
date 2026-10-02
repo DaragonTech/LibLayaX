@@ -1,0 +1,108 @@
+From 56ec18c86d876d7346f397aa5b32253ced14d9cd Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 18:30:08 +0100
+Subject: [PATCH 06/30] capi 1.0.5: fix heap corruption at host-thread exit
+ (thread_local std::string -> char buffer)
+
+MinGW frees the emutls block before running thread_local destructors on threads
+created outside winpthreads (CreateThread/TThread), so std::string's destructor
+freed freed memory. Found under Windows 11 ARM64/Prism; reproduced in Wine with
+WINEDEBUG=warn+heap.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/laya_c.cpp | 28 +++++++++++++++++++---------
+ 1 file changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index 5693656..75dbb0f 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -46,7 +46,17 @@ struct laya_agent {
+ };
+ 
+ namespace {
+-thread_local std::string last_error;
++// Per-thread error message. Deliberately a plain char array: a thread_local with a destructor
++// (std::string) is freed in the wrong order by MinGW's thread-exit cleanup on threads the host
++// created with CreateThread/TThread, which corrupts the heap (double free at thread exit).
++constexpr size_t error_capacity = 2048;
++thread_local char last_error_text[error_capacity];
++void set_last_error(const std::string& message) {
++    const size_t n = std::min(message.size(), error_capacity - 1);
++    std::memcpy(last_error_text, message.data(), n);
++    last_error_text[n] = '\0';
++}
++void clear_last_error() { last_error_text[0] = '\0'; }
+ 
+ // Hosts such as Delphi and Free Pascal unmask floating-point exceptions (invalid, divide by zero,
+ // overflow). ggml relies on IEEE non-stop arithmetic (e.g. -inf attention masks), so every entry
+@@ -258,7 +268,7 @@ char* copy(const std::string& text) {
+     return out;
+ }
+ char* error_json(const std::string& message) {
+-    last_error = message;
++    set_last_error(message);
+     return copy(laya::json{{"error", message}}.dump(-1, ' ', false, laya::json::error_handler_t::replace));
+ }
+ std::filesystem::path utf8_path(const char* text) {
+@@ -312,7 +322,7 @@ LAYA_API void LAYA_CALL laya_set_log_callback(laya_log_fn fn, void* user, int mi
+ 
+ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* options_json) {
+     call_guard fp;
+-    last_error.clear();
++    clear_last_error();
+     install_hooks();
+     try {
+         if (!model_dir || !*model_dir) throw std::invalid_argument("model_dir is empty");
+@@ -377,17 +387,17 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+         return agent;
+     } catch (const std::exception& e) {
+         laya::set_cpu_threads(0);
+-        last_error = describe(e);
++        set_last_error(describe(e));
+     } catch (...) {
+         laya::set_cpu_threads(0);
+-        last_error = "Unknown failure while loading the model";
++        set_last_error("Unknown failure while loading the model");
+     }
+     return nullptr;
+ }
+ 
+ LAYA_API char* LAYA_CALL laya_predict(laya_agent* agent, const char* request_json) {
+     call_guard fp;
+-    last_error.clear();
++    clear_last_error();
+     try {
+         if (!agent) throw std::invalid_argument("agent is NULL");
+         auto requests = parse_requests(request_json);
+@@ -409,7 +419,7 @@ LAYA_API char* LAYA_CALL laya_predict(laya_agent* agent, const char* request_jso
+ 
+ LAYA_API char* LAYA_CALL laya_prepare(laya_agent* agent, const char* request_json) {
+     call_guard fp;
+-    last_error.clear();
++    clear_last_error();
+     try {
+         if (!agent) throw std::invalid_argument("agent is NULL");
+         auto requests = parse_requests(request_json);
+@@ -424,7 +434,7 @@ LAYA_API char* LAYA_CALL laya_prepare(laya_agent* agent, const char* request_jso
+ 
+ LAYA_API char* LAYA_CALL laya_info(laya_agent* agent) {
+     call_guard fp;
+-    last_error.clear();
++    clear_last_error();
+     try {
+         if (!agent) throw std::invalid_argument("agent is NULL");
+         return copy(laya::json{{"backend", agent->impl.backend_name()}, {"device", agent->impl.device_name()},
+@@ -444,6 +454,6 @@ LAYA_API void LAYA_CALL laya_destroy(laya_agent* agent) {
+     try { delete agent; } catch (...) {}
+ }
+ 
+-LAYA_API const char* LAYA_CALL laya_last_error(void) { return last_error.c_str(); }
++LAYA_API const char* LAYA_CALL laya_last_error(void) { return last_error_text; }
+ 
+ }  // extern "C"
+-- 
+2.43.0
+

@@ -1,0 +1,1493 @@
+From 9dae796f6d820050f5dab9b7569edd218bbbc98c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 16:47:32 +0100
+Subject: [PATCH 01/30] Add laya.dll: flat C ABI shared library, Delphi binding
+ and tests
+
+- capi/: laya_c.h / laya_c.cpp, a JSON-in/JSON-out C ABI over laya::agent
+  (create/predict/prepare/info/destroy, error reporting, log callback),
+  exception-safe, thread-safe per agent, and FP-environment safe for hosts
+  such as Delphi that unmask floating-point exceptions (x87 + MXCSR).
+- CMake option LAYA_C_API builds laya.dll / liblaya.so (ggml linked in).
+- runtime: laya::set_cpu_threads(); laya-cli --threads N.
+- MinGW-w64 cross toolchain + compat header; ws2_32 for laya-http on MinGW.
+- tests/capi: C11 test suite, laya-cli parity test, synthetic checkpoint
+  generator for testing without downloading weights.
+- delphi/: Laya.pas binding, LayaTests.dpr, README.
+- .github/workflows/capi-windows.yml: MSVC CPU/Vulkan/CUDA builds + tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ .github/workflows/capi-windows.yml      | 122 ++++++++++
+ CMakeLists.txt                          |  11 +
+ capi/CMakeLists.txt                     |  42 ++++
+ capi/README.md                          | 100 ++++++++
+ capi/laya_c.cpp                         | 269 +++++++++++++++++++++
+ capi/laya_c.h                           |  92 +++++++
+ cmake/toolchains/mingw-compat.h         |  14 ++
+ cmake/toolchains/mingw-w64-x86_64.cmake |  19 ++
+ include/laya/runtime.hpp                |   3 +
+ scripts/capi/build-windows-mingw.sh     |  60 +++++
+ src/main.cpp                            |   3 +-
+ src/runtime.cpp                         |  10 +-
+ tests/capi/make_synthetic_model.py      | 146 ++++++++++++
+ tests/capi/test_capi.c                  | 303 ++++++++++++++++++++++++
+ tests/capi/test_parity.py               | 105 ++++++++
+ 15 files changed, 1297 insertions(+), 2 deletions(-)
+ create mode 100644 .github/workflows/capi-windows.yml
+ create mode 100644 capi/CMakeLists.txt
+ create mode 100644 capi/README.md
+ create mode 100644 capi/laya_c.cpp
+ create mode 100644 capi/laya_c.h
+ create mode 100644 cmake/toolchains/mingw-compat.h
+ create mode 100644 cmake/toolchains/mingw-w64-x86_64.cmake
+ create mode 100755 scripts/capi/build-windows-mingw.sh
+ create mode 100644 tests/capi/make_synthetic_model.py
+ create mode 100644 tests/capi/test_capi.c
+ create mode 100644 tests/capi/test_parity.py
+
+diff --git a/.github/workflows/capi-windows.yml b/.github/workflows/capi-windows.yml
+new file mode 100644
+index 0000000..465df09
+--- /dev/null
++++ b/.github/workflows/capi-windows.yml
+@@ -0,0 +1,122 @@
++name: laya.dll (Windows C API)
++
++# Builds laya.dll (the flat C ABI in capi/) with MSVC for CPU, Vulkan and CUDA, tests it against a
++# synthetic checkpoint on the runner's CPU, and uploads one zip per variant. Run it from the
++# Actions tab ("Run workflow") or on pushes that touch the library.
++
++on:
++  workflow_dispatch:
++  push:
++    paths: ['capi/**', 'tests/capi/**', 'src/**', 'include/**', 'CMakeLists.txt', '.github/workflows/capi-windows.yml']
++
++permissions:
++  contents: read
++
++jobs:
++  build:
++    strategy:
++      fail-fast: false
++      matrix:
++        variant: [cpu, vulkan, cuda12]
++    runs-on: windows-2022
++    timeout-minutes: 150
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          submodules: recursive
++      - uses: actions/setup-python@v5
++        with:
++          python-version: '3.12'
++      - name: MSVC
++        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c
++
++      - name: vcpkg (pinned like the release workflow)
++        uses: actions/checkout@v4
++        with:
++          repository: microsoft/vcpkg
++          ref: 398e9a716997ec84676dc7c7afdd51afcede2269
++          path: release-vcpkg
++      - name: Cache static dependencies
++        id: deps
++        uses: actions/cache@v4
++        with:
++          path: release-vcpkg/installed
++          key: release-vcpkg-static-398e9a716997ec84676dc7c7afdd51afcede2269-windows-2022
++      - name: Build static ICU and nlohmann-json
++        if: steps.deps.outputs.cache-hit != 'true'
++        shell: pwsh
++        run: |
++          ./release-vcpkg/bootstrap-vcpkg.bat -disableMetrics
++          if ($LASTEXITCODE) { exit $LASTEXITCODE }
++          ./release-vcpkg/vcpkg.exe install icu:x64-windows-static nlohmann-json:x64-windows-static
++          if ($LASTEXITCODE) { exit $LASTEXITCODE }
++
++      - name: CUDA toolkit
++        if: matrix.variant == 'cuda12'
++        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d
++        with:
++          cuda: '12.9.1'
++      - name: Vulkan SDK
++        if: matrix.variant == 'vulkan'
++        shell: pwsh
++        env:
++          SDK_VERSION: '1.4.357.0'
++        run: |
++          $installer = "$env:RUNNER_TEMP/VulkanSDK-Installer.exe"
++          curl.exe --fail --location --output $installer "https://sdk.lunarg.com/sdk/download/$env:SDK_VERSION/windows/vulkansdk-windows-X64-$env:SDK_VERSION.exe"
++          if ($LASTEXITCODE) { exit $LASTEXITCODE }
++          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLower() -ne '81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d') { throw 'Vulkan SDK checksum mismatch' }
++          & $installer --accept-licenses --default-answer --confirm-command install
++          if ($LASTEXITCODE) { exit $LASTEXITCODE }
++          "VULKAN_SDK=C:\VulkanSDK\$env:SDK_VERSION" >> $env:GITHUB_ENV
++          "C:\VulkanSDK\$env:SDK_VERSION\Bin" >> $env:GITHUB_PATH
++
++      - name: Configure
++        shell: pwsh
++        run: |
++          $opts = @('-DLAYA_PORTABLE=ON', '-DLAYA_C_API=ON', '-DCMAKE_BUILD_TYPE=Release',
++                    "-DCMAKE_TOOLCHAIN_FILE=$pwd/release-vcpkg/scripts/buildsystems/vcpkg.cmake",
++                    '-DVCPKG_TARGET_TRIPLET=x64-windows-static',
++                    '-DGGML_AVX=ON', '-DGGML_AVX2=ON', '-DGGML_FMA=ON', '-DGGML_F16C=ON')
++          switch ('${{ matrix.variant }}') {
++            'cpu'    { $opts += @('-DLAYA_CUDA=OFF', '-DLAYA_VULKAN=OFF') }
++            'vulkan' { $opts += @('-DLAYA_CUDA=OFF', '-DLAYA_VULKAN=ON', "-DCMAKE_PREFIX_PATH=$env:VULKAN_SDK") }
++            'cuda12' { $opts += @('-DLAYA_CUDA=ON', '-DLAYA_VULKAN=OFF', '-DCMAKE_CUDA_ARCHITECTURES=70;75;80;86;89;90;120',
++                                  "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe", "-DCUDAToolkit_ROOT=$env:CUDA_PATH",
++                                  '-DCMAKE_CUDA_FLAGS=-t 2') }
++          }
++          cmake -S . -B build -G Ninja @opts
++          if ($LASTEXITCODE) { exit $LASTEXITCODE }
++      - name: Build
++        run: cmake --build build --config Release --parallel 3 --target laya_c test-capi laya-cli
++
++      - name: Contract tests
++        run: ctest --test-dir build -C Release --output-on-failure -R "^capi$"
++
++      - name: End-to-end tests on a synthetic checkpoint (CPU backend)
++        shell: pwsh
++        run: |
++          python -m pip install --quiet numpy tokenizers
++          python tests/capi/make_synthetic_model.py "$env:RUNNER_TEMP/synth"
++          $env:LAYA_TEST_MODEL = "$env:RUNNER_TEMP/synth"
++          ./build/bin/test-capi.exe
++          if ($LASTEXITCODE) { exit $LASTEXITCODE }
++          python tests/capi/test_parity.py --lib build/bin/laya.dll --cli build/bin/laya-cli.exe --model "$env:RUNNER_TEMP/synth"
++          if ($LASTEXITCODE) { exit $LASTEXITCODE }
++
++      - name: Package
++        shell: pwsh
++        run: |
++          $out = "dist/laya-dll-windows-x64-${{ matrix.variant }}"
++          New-Item -ItemType Directory -Force $out | Out-Null
++          Copy-Item build/bin/laya.dll, capi/laya_c.h, delphi/Laya.pas, delphi/LayaTests.dpr, capi/README.md $out
++          if ('${{ matrix.variant }}' -eq 'cuda12') {
++            # cuBLAS is linked dynamically on Windows (CUDA EULA permits redistribution of these DLLs).
++            Copy-Item "$env:CUDA_PATH/bin/cublas64_12.dll", "$env:CUDA_PATH/bin/cublasLt64_12.dll" $out
++          }
++          dumpbin /dependents build/bin/laya.dll
++      - uses: actions/upload-artifact@v4
++        with:
++          name: laya-dll-windows-x64-${{ matrix.variant }}
++          path: dist/*
++          if-no-files-found: error
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b64d5ff..05035ca 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -8,6 +8,11 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+ option(LAYA_CUDA "Build the NVIDIA CUDA inference backend" ON)
+ option(LAYA_VULKAN "Build the Vulkan inference backend" OFF)
+ option(LAYA_COREML "Build the macOS Core ML inference backend" OFF)
++option(LAYA_C_API "Build the flat C ABI shared library (laya.dll / liblaya.so) for FFI consumers" OFF)
++if(LAYA_C_API)
++  # The engine and ggml are linked into the shared library, so they must be position independent.
++  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
++endif()
+ if(LAYA_COREML)
+   if(NOT APPLE)
+     message(FATAL_ERROR "LAYA_COREML is available only on macOS")
+@@ -147,6 +152,9 @@ target_include_directories(laya-http PUBLIC include PRIVATE third_party/cpp-http
+ target_compile_features(laya-http PUBLIC cxx_std_20)
+ target_compile_options(laya-http PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall;-Wextra;-Wpedantic>)
+ target_link_libraries(laya-http PUBLIC nlohmann_json::nlohmann_json Threads::Threads)
++if(MINGW)
++  target_link_libraries(laya-http PUBLIC ws2_32)  # MSVC gets this from cpp-httplib's #pragma comment(lib)
++endif()
+ target_link_libraries(laya-cli PRIVATE laya laya-http)
+ include(CTest)
+ if(BUILD_TESTING)
+@@ -262,3 +270,6 @@ if(BUILD_TESTING)
+     add_test(NAME compensated-matmul COMMAND test-matmul)
+   endif()
+ endif()
++if(LAYA_C_API)
++  add_subdirectory(capi)
++endif()
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+new file mode 100644
+index 0000000..fe5f8b1
+--- /dev/null
++++ b/capi/CMakeLists.txt
+@@ -0,0 +1,42 @@
++# Flat C ABI shared library over laya.cpp: laya.dll (Windows), liblaya.so (Linux), liblaya.dylib (macOS).
++# Enable from the top level with -DLAYA_C_API=ON. Build ggml statically (-DBUILD_SHARED_LIBS=OFF)
++# to get a single self-contained library.
++set(LAYA_C_VERSION "1.0.0" CACHE STRING "Version string reported by laya_version()")
++
++add_library(laya_c SHARED laya_c.cpp)
++target_include_directories(laya_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
++target_link_libraries(laya_c PRIVATE laya)
++target_compile_features(laya_c PRIVATE cxx_std_20)
++target_compile_definitions(laya_c PRIVATE LAYA_C_VERSION="${LAYA_C_VERSION}"
++  $<$<BOOL:${LAYA_CUDA}>:LAYA_CUDA=1> $<$<BOOL:${LAYA_VULKAN}>:LAYA_VULKAN=1>)
++target_compile_options(laya_c PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall;-Wextra>)
++set_target_properties(laya_c PROPERTIES
++  OUTPUT_NAME laya
++  CXX_VISIBILITY_PRESET hidden
++  VISIBILITY_INLINES_HIDDEN ON
++  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
++  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
++if(WIN32)
++  set_target_properties(laya_c PROPERTIES PREFIX "")  # laya.dll, not liblaya.dll
++endif()
++if(MINGW)
++  # A Delphi/.NET host has no MinGW runtime: fold libgcc, libstdc++ and winpthread into the DLL.
++  target_link_options(laya_c PRIVATE -static-libgcc -static-libstdc++ -static -Wl,--exclude-all-symbols)
++elseif(UNIX AND NOT APPLE)
++  target_link_options(laya_c PRIVATE -Wl,--exclude-libs,ALL -Wl,--no-undefined)
++endif()
++
++if(BUILD_TESTING)
++  add_executable(test-capi ${CMAKE_SOURCE_DIR}/tests/capi/test_capi.c)
++  set_target_properties(test-capi PROPERTIES C_STANDARD 11 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
++  target_link_libraries(test-capi PRIVATE laya_c)
++  if(MINGW)
++    target_link_options(test-capi PRIVATE -static)
++  elseif(UNIX)
++    find_package(Threads REQUIRED)
++    target_link_libraries(test-capi PRIVATE Threads::Threads m)
++  endif()
++  # The model-dependent tests are skipped (exit 77) unless LAYA_TEST_MODEL names a checkpoint.
++  add_test(NAME capi COMMAND test-capi)
++  set_tests_properties(capi PROPERTIES SKIP_RETURN_CODE 77)
++endif()
+diff --git a/capi/README.md b/capi/README.md
+new file mode 100644
+index 0000000..be3f9c6
+--- /dev/null
++++ b/capi/README.md
+@@ -0,0 +1,100 @@
++# laya.dll — C API for laya.cpp
++
++A flat C ABI around [laya.cpp](https://github.com/lkarlslund/laya.cpp) so Laya typed-decision
++inference can be called in-process from Delphi, C#, Python (ctypes) or anything else that can
++load a DLL. Everything crosses the boundary as UTF-8 JSON, the same request and response format
++`laya-cli` uses, so no C++ types leak and the binding stays tiny.
++
++```c
++laya_agent* a = laya_create("C:\\models\\laya", "{\"backend\":\"cpu\"}");
++char* out = laya_predict(a, "{\"state\":\"Please refund the duplicate charge.\","
++                            "\"questions\":{\"refund\":{\"type\":\"noul\","
++                            "\"instructions\":\"Does the customer ask for a refund?\"}}}");
++/* {"results":[{"model":"laya-rl-agent","answers":{"refund":{"type":"noul","noul":0.97,...}}}],
++    "elapsed_ms":3.1,"backend":"CPU","device":"..."} */
++laya_free_string(out);
++laya_destroy(a);
++```
++
++## Functions
++
++| Function | Purpose |
++|---|---|
++| `laya_create(dir, options)` | Load a checkpoint. Returns `NULL` on failure; see `laya_last_error()`. |
++| `laya_predict(agent, request)` | Run one request or an array of requests. Returns JSON (`results` or `error`). |
++| `laya_prepare(agent, request)` | Tokenized model inputs only (debugging). |
++| `laya_info(agent)` | Backend, device, model name, variant and limits as JSON. |
++| `laya_free_string(s)` | Free any string returned by the three functions above. |
++| `laya_destroy(agent)` | Unload. Safe with `NULL`. |
++| `laya_last_error()` | Last failure on the calling thread. |
++| `laya_set_log_callback(fn, user, min_level)` | Route engine logs (default: warnings to stderr). |
++| `laya_version()`, `laya_api_version()` | Identification. |
++
++Options for `laya_create` (all optional): `backend` `cpu`|`cuda`|`vulkan`; `variant`
++`english`|`multilingual`|`typed-decisions` (picks `<dir>/<variant>` when `dir` is a model-store
++root); `precision` `fp32`|`fp16`|`bf16`; `flash`, `tensor_core` (the fast CUDA path is both
++`true`); `allow_truncation`; `threads` (CPU worker threads, default all cores). Unknown keys
++are rejected, so typos fail loudly.
++
++## Behaviour that matters to a host application
++
++* **No exceptions escape.** Errors come back as `NULL` + `laya_last_error()`, or as
++  `{"error":"..."}`. Bad requests leave the agent usable.
++* **Thread safe.** One agent can be shared between threads, and calls on it are serialized
++  inside the library. For parallel throughput, batch requests (pass an array) rather than
++  calling from many threads.
++* **Floating-point state is protected.** Delphi and Free Pascal unmask FP exceptions, which
++  would otherwise make the engine's IEEE arithmetic raise `EInvalidOp`. Every entry point masks
++  exceptions (x87 and SSE/MXCSR) and restores the caller's exact state on return. You don't
++  need `SetExceptionMask` in your Delphi code.
++* **Memory.** A loaded model takes about 1.7 GB of RAM (CPU, fp32) or the equivalent in VRAM.
++  Create one agent per model and keep it for the life of the process.
++* **Paths are UTF-8.** Non-ASCII Windows paths work.
++* **Fatal engine asserts** (a ggml internal invariant failing, which shouldn't happen with
++  validated checkpoints) still terminate the process. The message is sent to your log callback
++  first.
++
++## Building
++
++The library is an opt-in target: `-DLAYA_C_API=ON`. Build ggml statically so you get one
++self-contained file.
++
++**Windows, MSVC (CPU/Vulkan/CUDA)**: see `.github/workflows/capi-windows.yml`, which builds and
++tests all three variants on GitHub Actions. Locally, from a VS 2022 x64 prompt with vcpkg:
++
++```
++vcpkg install icu:x64-windows-static nlohmann-json:x64-windows-static
++cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLAYA_PORTABLE=ON -DLAYA_C_API=ON ^
++  -DLAYA_CUDA=OFF -DLAYA_VULKAN=ON ^
++  -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static
++cmake --build build --target laya_c
++```
++
++**Windows from Linux (MinGW-w64, CPU)**: how the shipped `laya.dll` was made. It needs a
++static ICU cross-built with MinGW (see `BUILD-NOTES.md` in the package).
++
++```
++cmake -S . -B build-win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64-x86_64.cmake \
++  -DCMAKE_BUILD_TYPE=Release -DLAYA_CUDA=OFF -DLAYA_C_API=ON -DBUILD_SHARED_LIBS=OFF \
++  -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_OPENMP=OFF \
++  -DICU_ROOT=... -DCMAKE_CXX_FLAGS=-DU_STATIC_IMPLEMENTATION
++cmake --build build-win --target laya_c test-capi
++```
++
++**Linux**: `cmake -S . -B build -DLAYA_C_API=ON -DBUILD_SHARED_LIBS=OFF [-DLAYA_CUDA=OFF]`
++produces `build/bin/liblaya.so`.
++
++## Tests
++
++* `tests/capi/test_capi.c`: C11 test suite. Runs API-contract tests (bad paths, bad
++  options, `NULL` handling, error reporting) and, when `LAYA_TEST_MODEL` points at a checkpoint,
++  end-to-end tests: all question types, batches, UTF-8 and JSON-object states, determinism,
++  malformed requests, over-long input rejection, four threads sharing one agent, reload, and FP
++  state preservation with exceptions unmasked like a Delphi host. `ctest -R capi`.
++* `tests/capi/test_parity.py`: loads the library with ctypes and checks that its answers are
++  byte-identical to `laya-cli` on the same checkpoint. With `--compare-dump` it also compares
++  against a dump made on another platform.
++* `tests/capi/make_synthetic_model.py`: writes a checkpoint with the exact production
++  architecture and a real BPE tokenizer but random weights, for testing without downloading
++  the model. Its answers are meaningless; it only proves the pipeline end to end.
++* `delphi/LayaTests.dpr`: the same kind of tests through the Delphi binding.
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+new file mode 100644
+index 0000000..4a96396
+--- /dev/null
++++ b/capi/laya_c.cpp
+@@ -0,0 +1,269 @@
++// laya_c.cpp - implementation of the flat C ABI declared in laya_c.h.
++#define LAYA_C_BUILD
++#include "laya_c.h"
++#include "laya/runtime.hpp"
++#include "ggml.h"
++
++#include <algorithm>
++#include <cfenv>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <mutex>
++#include <new>
++#include <string>
++#include <thread>
++#if defined(__x86_64__) || defined(_M_X64)
++#include <xmmintrin.h>
++#endif
++
++#ifndef LAYA_C_VERSION
++#define LAYA_C_VERSION "1.0.0"
++#endif
++
++struct laya_agent {
++    laya::agent impl;
++    std::mutex lock;
++    std::string directory, variant, model_name;
++    int max_len = 0, head_max_len = 0;
++};
++
++namespace {
++thread_local std::string last_error;
++
++// Hosts such as Delphi and Free Pascal unmask floating-point exceptions (invalid, divide by zero,
++// overflow). ggml relies on IEEE non-stop arithmetic (e.g. -inf attention masks), so every entry
++// point masks all FP exceptions and restores the caller's exact environment, flags included, on
++// exit. Threads ggml starts during a call inherit the masked state (POSIX) or start with the OS
++// default, which is masked (Windows).
++// feholdexcept covers x87 everywhere, but MinGW's version leaves the SSE control register (MXCSR)
++// unmasked, and SSE is what ggml uses on x86-64, so MXCSR is handled explicitly.
++struct fp_guard {
++    std::fenv_t saved;
++#if defined(__x86_64__) || defined(_M_X64)
++    unsigned int saved_csr;
++    fp_guard() : saved_csr(_mm_getcsr()) {
++        std::feholdexcept(&saved);
++        _mm_setcsr((saved_csr | 0x1F80u) & ~0x3Fu);  // mask all six exceptions, clear flags
++    }
++    ~fp_guard() {
++        std::fesetenv(&saved);
++        _mm_setcsr(saved_csr);
++    }
++#else
++    fp_guard() { std::feholdexcept(&saved); }
++    ~fp_guard() { std::fesetenv(&saved); }
++#endif
++    fp_guard(const fp_guard&) = delete;
++    fp_guard& operator=(const fp_guard&) = delete;
++};
++
++// Logging: one process-wide sink shared by the library and ggml.
++std::mutex log_lock;
++laya_log_fn log_fn = nullptr;
++void* log_user = nullptr;
++std::atomic<int> log_min{GGML_LOG_LEVEL_WARN};
++
++void forward_log(ggml_log_level level, const char* text, void*) {
++    if (int(level) != GGML_LOG_LEVEL_CONT && int(level) < log_min.load()) return;
++    std::lock_guard<std::mutex> guard(log_lock);
++    if (log_fn) log_fn(int(level), text, log_user);
++    else if (int(level) >= GGML_LOG_LEVEL_WARN) std::fputs(text, stderr);
++}
++void forward_abort(const char* message) {  // ggml aborts the process afterwards; at least say why
++    forward_log(GGML_LOG_LEVEL_ERROR, message, nullptr);
++    forward_log(GGML_LOG_LEVEL_CONT, "\n", nullptr);
++}
++void install_hooks() {
++    static std::once_flag once;
++    std::call_once(once, [] {
++        ggml_log_set(forward_log, nullptr);
++        ggml_set_abort_callback(forward_abort);
++    });
++}
++
++char* copy(const std::string& text) {
++    auto* out = static_cast<char*>(std::malloc(text.size() + 1));
++    if (out) std::memcpy(out, text.c_str(), text.size() + 1);
++    return out;
++}
++char* error_json(const std::string& message) {
++    last_error = message;
++    return copy(laya::json{{"error", message}}.dump(-1, ' ', false, laya::json::error_handler_t::replace));
++}
++std::filesystem::path utf8_path(const char* text) {
++    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text)));
++}
++std::string path_utf8(const std::filesystem::path& path) {
++    auto u8 = path.u8string();
++    return std::string(u8.begin(), u8.end());
++}
++laya::json parse_requests(const char* text) {
++    if (!text) throw std::invalid_argument("request_json is NULL");
++    auto value = laya::json::parse(text);
++    return value.is_array() ? value : laya::json::array({value});
++}
++std::string describe(const std::exception& e) { return e.what(); }
++}  // namespace
++
++extern "C" {
++
++LAYA_API const char* LAYA_CALL laya_version(void) {
++    static const std::string text = std::string("laya_c " LAYA_C_VERSION " (api ") +
++        std::to_string(LAYA_C_API_VERSION) + "; backends: cpu"
++#ifdef LAYA_CUDA
++        ",cuda"
++#endif
++#ifdef LAYA_VULKAN
++        ",vulkan"
++#endif
++        ")";
++    return text.c_str();
++}
++
++LAYA_API int LAYA_CALL laya_api_version(void) { return LAYA_C_API_VERSION; }
++
++LAYA_API void LAYA_CALL laya_set_log_callback(laya_log_fn fn, void* user, int min_level) {
++    install_hooks();
++    std::lock_guard<std::mutex> guard(log_lock);
++    log_fn = fn;
++    log_user = user;
++    log_min = fn ? min_level : int(GGML_LOG_LEVEL_WARN);
++}
++
++LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* options_json) {
++    fp_guard fp;
++    last_error.clear();
++    install_hooks();
++    try {
++        if (!model_dir || !*model_dir) throw std::invalid_argument("model_dir is empty");
++        const auto options = options_json && *options_json ? laya::json::parse(options_json) : laya::json::object();
++        if (!options.is_object()) throw std::invalid_argument("options_json must be a JSON object");
++        for (auto& [key, unused] : options.items())
++            if (key != "backend" && key != "variant" && key != "precision" && key != "flash" &&
++                key != "tensor_core" && key != "allow_truncation" && key != "threads")
++                throw std::invalid_argument("Unknown option: " + key);
++
++        const std::string backend_text = options.value("backend", "cpu");
++        laya::backend_type backend;
++        if (backend_text == "cpu") backend = laya::backend_type::cpu;
++        else if (backend_text == "cuda") backend = laya::backend_type::cuda;
++        else if (backend_text == "vulkan") backend = laya::backend_type::vulkan;
++        else throw std::invalid_argument("Unknown backend: " + backend_text);
++
++        const std::string precision_text = options.value("precision", "fp32");
++        laya::precision_type precision;
++        if (precision_text == "fp32") precision = laya::precision_type::fp32;
++        else if (precision_text == "fp16") precision = laya::precision_type::fp16;
++        else if (precision_text == "bf16") precision = laya::precision_type::bf16;
++        else throw std::invalid_argument("Unknown precision: " + precision_text);
++
++        // Same resolution as laya-cli: a store root plus a variant selects <root>/<variant>,
++        // except "english", which lives at the root. A checkpoint directory is used as given.
++        auto directory = utf8_path(model_dir);
++        std::string variant = options.value("variant", "");
++        if (!variant.empty() && variant != "english" && variant != "multilingual" && variant != "typed-decisions")
++            throw std::invalid_argument("Unknown model variant: " + variant);
++        if (!variant.empty() && variant != "english" &&
++            (std::filesystem::exists(directory / variant / "rl_agent_config.json") ||
++             !std::filesystem::exists(directory / "rl_agent_config.json")))
++            directory /= variant;
++
++        const int threads = options.value("threads", 0);
++        if (threads < 0 || threads > 1024) throw std::invalid_argument("threads must be 0..1024");
++        const bool flash = options.value("flash", precision != laya::precision_type::fp32);
++        const bool tensor_core = options.value("tensor_core", false);
++        const bool allow_truncation = options.value("allow_truncation", false);
++
++        static std::mutex create_lock;  // set_cpu_threads is process-wide; keep creation atomic
++        std::lock_guard<std::mutex> guard(create_lock);
++        laya::set_cpu_threads(threads ? threads : int(std::max(1u, std::thread::hardware_concurrency())));
++        auto* agent = new laya_agent{laya::agent(directory, backend, precision, flash, tensor_core, allow_truncation),
++                                     {}, path_utf8(directory), {}, {}};
++        laya::set_cpu_threads(0);
++
++        std::ifstream config_file(directory / "rl_agent_config.json");
++        const auto config = laya::json::parse(config_file, nullptr, false);
++        if (!config.is_discarded()) {
++            agent->model_name = config.value("model_name", "");
++            agent->max_len = config.value("max_len", 512);
++            agent->head_max_len = config.value("head_max_len", 192);
++            agent->variant = agent->model_name == "laya-typed-decisions" ? "typed-decisions" :
++                             config.value("encoder", "") == "jhu-clsp/mmBERT-base" ? "multilingual" : "english";
++        }
++        return agent;
++    } catch (const std::exception& e) {
++        laya::set_cpu_threads(0);
++        last_error = describe(e);
++    } catch (...) {
++        laya::set_cpu_threads(0);
++        last_error = "Unknown failure while loading the model";
++    }
++    return nullptr;
++}
++
++LAYA_API char* LAYA_CALL laya_predict(laya_agent* agent, const char* request_json) {
++    fp_guard fp;
++    last_error.clear();
++    try {
++        if (!agent) throw std::invalid_argument("agent is NULL");
++        auto requests = parse_requests(request_json);
++        std::lock_guard<std::mutex> guard(agent->lock);  // direct calls on one agent must be serialized
++        const auto start = std::chrono::steady_clock::now();
++        auto results = agent->impl.predict(requests);
++        const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++        return copy(laya::json{{"results", results}, {"elapsed_ms", elapsed}, {"backend", agent->impl.backend_name()},
++                               {"device", agent->impl.device_name()}}
++                        .dump(-1, ' ', false, laya::json::error_handler_t::replace));
++    } catch (const std::bad_alloc&) {
++        return error_json("Out of memory");
++    } catch (const std::exception& e) {
++        return error_json(describe(e));
++    } catch (...) {
++        return error_json("Unknown failure during prediction");
++    }
++}
++
++LAYA_API char* LAYA_CALL laya_prepare(laya_agent* agent, const char* request_json) {
++    fp_guard fp;
++    last_error.clear();
++    try {
++        if (!agent) throw std::invalid_argument("agent is NULL");
++        auto requests = parse_requests(request_json);
++        std::lock_guard<std::mutex> guard(agent->lock);
++        return copy(agent->impl.prepare_json(requests).dump());
++    } catch (const std::exception& e) {
++        return error_json(describe(e));
++    } catch (...) {
++        return error_json("Unknown failure during preparation");
++    }
++}
++
++LAYA_API char* LAYA_CALL laya_info(laya_agent* agent) {
++    fp_guard fp;
++    last_error.clear();
++    try {
++        if (!agent) throw std::invalid_argument("agent is NULL");
++        return copy(laya::json{{"backend", agent->impl.backend_name()}, {"device", agent->impl.device_name()},
++                               {"model_dir", agent->directory}, {"model_name", agent->model_name},
++                               {"variant", agent->variant}, {"max_len", agent->max_len},
++                               {"head_max_len", agent->head_max_len}}
++                        .dump(-1, ' ', false, laya::json::error_handler_t::replace));
++    } catch (const std::exception& e) {
++        return error_json(describe(e));
++    }
++}
++
++LAYA_API void LAYA_CALL laya_free_string(char* text) { std::free(text); }
++
++LAYA_API void LAYA_CALL laya_destroy(laya_agent* agent) {
++    fp_guard fp;
++    try { delete agent; } catch (...) {}
++}
++
++LAYA_API const char* LAYA_CALL laya_last_error(void) { return last_error.c_str(); }
++
++}  // extern "C"
+diff --git a/capi/laya_c.h b/capi/laya_c.h
+new file mode 100644
+index 0000000..d447aff
+--- /dev/null
++++ b/capi/laya_c.h
+@@ -0,0 +1,92 @@
++/* laya_c.h - flat C ABI over laya.cpp for FFI consumers (Delphi, C#, Python ctypes, ...).
++ *
++ * Design rules
++ *  - Everything crosses the boundary as UTF-8, NUL-terminated JSON text. No C++ types leak.
++ *  - Strings returned by laya_predict / laya_prepare / laya_info are heap-allocated by the
++ *    library and MUST be released with laya_free_string. `const char*` results are owned by the
++ *    library.
++ *  - No C++ exception ever escapes; failures are reported as NULL (+ laya_last_error) or as a
++ *    JSON object {"error": "..."}.
++ *  - One agent may be shared between threads: calls on the same agent are serialized inside the
++ *    library (upstream requirement). Separate agents run independently.
++ *  - 64-bit only. On Win64 there is a single calling convention, so cdecl/stdcall declarations
++ *    on the caller side are equivalent.
++ */
++#ifndef LAYA_C_H
++#define LAYA_C_H
++
++#ifdef _WIN32
++#  define LAYA_CALL __cdecl
++#  ifdef LAYA_C_BUILD
++#    define LAYA_API __declspec(dllexport)
++#  else
++#    define LAYA_API __declspec(dllimport)
++#  endif
++#else
++#  define LAYA_CALL
++#  define LAYA_API __attribute__((visibility("default")))
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define LAYA_C_API_VERSION 1
++
++typedef struct laya_agent laya_agent;
++
++/* Log levels match ggml: 1=debug 2=info 3=warn 4=error 5=continuation of previous line. */
++typedef void (LAYA_CALL *laya_log_fn)(int level, const char* text_utf8, void* user);
++
++/* Library identification, e.g. "laya_c 1.0.0 (api 1; backends: cpu,vulkan)". Never NULL. */
++LAYA_API const char* LAYA_CALL laya_version(void);
++
++/* Returns LAYA_C_API_VERSION of the binary; compare with the header you compiled against. */
++LAYA_API int LAYA_CALL laya_api_version(void);
++
++/* Route library and engine log output. NULL restores the default (warnings+errors to stderr).
++ * Messages below min_level are dropped. Process-wide; call before laya_create. The callback may
++ * be invoked from worker threads. */
++LAYA_API void LAYA_CALL laya_set_log_callback(laya_log_fn fn, void* user, int min_level);
++
++/* Load a checkpoint. model_dir is a UTF-8 path to either a checkpoint directory (contains
++ * rl_agent_config.json) or a model store root combined with the "variant" option.
++ * options_json may be NULL or "" for defaults:
++ *   "backend":   "cpu" (default) | "cuda" | "vulkan"
++ *   "variant":   "english" | "multilingual" | "typed-decisions"  (appends the variant folder
++ *                when model_dir is a store root; ignored when model_dir is itself a checkpoint)
++ *   "precision": "fp32" (default) | "fp16" | "bf16"
++ *   "flash": bool, "tensor_core": bool   (CUDA fast path: both true)
++ *   "allow_truncation": bool             (default false: over-long requests are rejected)
++ *   "threads": int                       (CPU backend worker threads; default = all cores)
++ * Returns NULL on failure; call laya_last_error() for the reason. */
++LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir_utf8, const char* options_json);
++
++/* Run inference. request_json is one request object or an array of them:
++ *   {"state": "...", "questions": {"id": {"type": "noul|choice|score", "instructions": "...",
++ *                                         "criteria": ...}}}
++ * Returns {"results":[...], "elapsed_ms":n, "backend":"...", "device":"..."} on success or
++ * {"error":"..."} on failure (the same shapes laya-cli prints). Free with laya_free_string.
++ * Returns NULL only if memory allocation fails. */
++LAYA_API char* LAYA_CALL laya_predict(laya_agent* agent, const char* request_json);
++
++/* Tokenize/prepare only (no inference): the model input tensors as JSON. For debugging. */
++LAYA_API char* LAYA_CALL laya_prepare(laya_agent* agent, const char* request_json);
++
++/* {"backend":"...","device":"...","model_dir":"...","model_name":"...","variant":"...",
++ *  "max_len":n,"head_max_len":n}. Free with laya_free_string. */
++LAYA_API char* LAYA_CALL laya_info(laya_agent* agent);
++
++LAYA_API void LAYA_CALL laya_free_string(char* s);
++
++/* Release the model. Safe with NULL. Do not call while another thread is using the agent. */
++LAYA_API void LAYA_CALL laya_destroy(laya_agent* agent);
++
++/* Message for the most recent failure on the calling thread ("" if none). Owned by the library;
++ * valid until the next laya_* call on the same thread. */
++LAYA_API const char* LAYA_CALL laya_last_error(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif /* LAYA_C_H */
+diff --git a/cmake/toolchains/mingw-compat.h b/cmake/toolchains/mingw-compat.h
+new file mode 100644
+index 0000000..4732afc
+--- /dev/null
++++ b/cmake/toolchains/mingw-compat.h
+@@ -0,0 +1,14 @@
++/* Force-included by the MinGW toolchain file. Older MinGW-w64 headers (< v12, e.g. Ubuntu 24.04)
++ * lack the Windows 8+ thread power-throttling declarations that ggml-cpu uses. */
++#ifdef _WIN32
++#include <_mingw.h>
++#if defined(__MINGW64_VERSION_MAJOR) && __MINGW64_VERSION_MAJOR < 12 && !defined(THREAD_POWER_THROTTLING_CURRENT_VERSION)
++typedef struct _THREAD_POWER_THROTTLING_STATE {
++    unsigned long Version;
++    unsigned long ControlMask;
++    unsigned long StateMask;
++} THREAD_POWER_THROTTLING_STATE;
++#define THREAD_POWER_THROTTLING_CURRENT_VERSION 1
++#define THREAD_POWER_THROTTLING_EXECUTION_SPEED 0x1
++#endif
++#endif
+diff --git a/cmake/toolchains/mingw-w64-x86_64.cmake b/cmake/toolchains/mingw-w64-x86_64.cmake
+new file mode 100644
+index 0000000..9ede92e
+--- /dev/null
++++ b/cmake/toolchains/mingw-w64-x86_64.cmake
+@@ -0,0 +1,19 @@
++# Cross-compile Windows x64 binaries (e.g. laya.dll) from Linux with MinGW-w64 (POSIX threads).
++#   cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64-x86_64.cmake ...
++set(CMAKE_SYSTEM_NAME Windows)
++set(CMAKE_SYSTEM_PROCESSOR AMD64)
++set(CMAKE_C_COMPILER   x86_64-w64-mingw32-gcc-posix)
++set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++-posix)
++set(CMAKE_RC_COMPILER  x86_64-w64-mingw32-windres)
++set(CMAKE_FIND_ROOT_PATH /usr/x86_64-w64-mingw32)
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
++set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
++# Run cross-built tests through Wine when available.
++find_program(WINE_EXECUTABLE wine)
++if(WINE_EXECUTABLE)
++  set(CMAKE_CROSSCOMPILING_EMULATOR ${WINE_EXECUTABLE})
++endif()
++set(CMAKE_C_FLAGS_INIT   "-include ${CMAKE_CURRENT_LIST_DIR}/mingw-compat.h")
++set(CMAKE_CXX_FLAGS_INIT "-include ${CMAKE_CURRENT_LIST_DIR}/mingw-compat.h")
+diff --git a/include/laya/runtime.hpp b/include/laya/runtime.hpp
+index 0f0c1a8..0c2b25b 100644
+--- a/include/laya/runtime.hpp
++++ b/include/laya/runtime.hpp
+@@ -9,6 +9,9 @@ namespace laya {
+ enum class backend_type { cuda, cpu, vulkan, coreml };
+ enum class precision_type { fp32, fp16, bf16 };
+ using json = nlohmann::ordered_json;
++// CPU backend worker threads for runtimes created afterwards; 0 keeps the ggml default.
++void set_cpu_threads(int count);
++int cpu_threads();
+ struct batch {
+     int size = 0, length = 0, options = 0;
+     std::vector<int32_t> ids, lengths, markers, counts, types;
+diff --git a/scripts/capi/build-windows-mingw.sh b/scripts/capi/build-windows-mingw.sh
+new file mode 100755
+index 0000000..1990901
+--- /dev/null
++++ b/scripts/capi/build-windows-mingw.sh
+@@ -0,0 +1,60 @@
++#!/usr/bin/env bash
++# Reproducible cross-build of laya.dll (Windows x64, CPU backend) on Ubuntu 24.04 / Debian.
++# Produces build-win/bin/laya.dll with no runtime dependencies beyond Windows system DLLs
++# (MinGW runtime, libstdc++, winpthread and ICU are linked statically).
++#
++#   scripts/capi/build-windows-mingw.sh            # build
++#   RUN_TESTS=1 LAYA_TEST_MODEL=/path/to/checkpoint scripts/capi/build-windows-mingw.sh
++#
++# Needs: apt install mingw-w64 cmake ninja-build nlohmann-json3-dev curl  (+ wine64 for tests)
++set -euo pipefail
++ROOT=$(cd "$(dirname "$0")/../.." && pwd)
++WORK=${WORK:-$ROOT/build-deps}
++ICU_VERSION=${ICU_VERSION:-76-1}
++ICU_TGZ=icu4c-${ICU_VERSION/-/_}-src.tgz
++JOBS=${JOBS:-$(nproc)}
++mkdir -p "$WORK"
++cd "$WORK"
++
++# 1. Static ICU for MinGW (cross builds need a native ICU build for the data tools).
++if [ ! -f icu-win/lib/libsicudt.a ]; then
++  [ -f "$ICU_TGZ" ] || curl -fsSL -o "$ICU_TGZ" "https://github.com/unicode-org/icu/releases/download/release-$ICU_VERSION/$ICU_TGZ"
++  rm -rf icu icu-host icu-win-build && tar xzf "$ICU_TGZ" && mkdir -p icu-host icu-win-build
++  (cd icu-host && ../icu/source/runConfigureICU Linux --disable-tests --disable-samples --disable-extras >/dev/null && make -j"$JOBS" >/dev/null)
++  (cd icu-win-build && CC=x86_64-w64-mingw32-gcc-posix CXX=x86_64-w64-mingw32-g++-posix CFLAGS=-O2 CXXFLAGS="-O2 -std=c++17" \
++     ../icu/source/configure --host=x86_64-w64-mingw32 --with-cross-build="$WORK/icu-host" \
++       --enable-static --disable-shared --with-data-packaging=static --disable-tests --disable-samples \
++       --disable-extras --disable-tools --disable-dyload --prefix="$WORK/icu-win" >/dev/null &&
++   make -j"$JOBS" >/dev/null && (make install >/dev/null 2>&1 || true))
++  # ICU's installer puts the static data archive in bin/ for MinGW targets; place it by hand.
++  mkdir -p icu-win/lib && cp icu-win-build/lib/sicudt.a icu-win/lib/libsicudt.a
++fi
++
++# 2. Header-only nlohmann-json, isolated so the cross compiler never sees /usr/include.
++if [ ! -d nl/include/nlohmann ]; then
++  mkdir -p nl/share/cmake nl/include
++  cp -r /usr/share/cmake/nlohmann_json nl/share/cmake/ && cp -r /usr/include/nlohmann nl/include/
++fi
++
++# 3. laya.dll (AVX2/FMA/F16C baseline: any x86-64 CPU since ~2013-2015).
++I=$WORK/icu-win
++cmake -S "$ROOT" -B "$ROOT/build-win" -G Ninja -DCMAKE_BUILD_TYPE=Release \
++  -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/toolchains/mingw-w64-x86_64.cmake" \
++  -DLAYA_CUDA=OFF -DLAYA_C_API=ON -DBUILD_SHARED_LIBS=OFF \
++  -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
++  -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF \
++  -DICU_ROOT="$I" -DICU_INCLUDE_DIR="$I/include" -DICU_UC_LIBRARY_RELEASE="$I/lib/libsicuuc.a" \
++  -DICU_I18N_LIBRARY_RELEASE="$I/lib/libsicuin.a" -DICU_DATA_LIBRARY_RELEASE="$I/lib/libsicudt.a" \
++  -DCMAKE_CXX_FLAGS="-DU_STATIC_IMPLEMENTATION" -Dnlohmann_json_DIR="$WORK/nl/share/cmake/nlohmann_json"
++cmake --build "$ROOT/build-win" --parallel "$JOBS" --target laya_c test-capi laya-cli
++x86_64-w64-mingw32-strip --strip-unneeded "$ROOT/build-win/bin/laya.dll"
++x86_64-w64-mingw32-objdump -p "$ROOT/build-win/bin/laya.dll" | grep "DLL Name"
++echo "built $ROOT/build-win/bin/laya.dll"
++
++# 4. Optional: run the C test suite under Wine.
++if [ "${RUN_TESTS:-0}" = 1 ]; then
++  export WINEDEBUG=-all
++  model=""
++  [ -n "${LAYA_TEST_MODEL:-}" ] && model="Z:${LAYA_TEST_MODEL//\//\\}"
++  (cd "$ROOT/build-win/bin" && LAYA_TEST_MODEL="$model" wine test-capi.exe) || [ $? = 77 ]
++fi
+diff --git a/src/main.cpp b/src/main.cpp
+index bb8f6cb..022b652 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -39,6 +39,7 @@ int main(int argc, char** argv) {
+             else if (arg == "--max-pending-requests" && i+1 < argc) { http.max_pending_requests = number(argv[++i], 256); http_option = true; }
+             else if (arg == "--batch-wait-ms" && i+1 < argc) { http.batch_wait_ms = number(argv[++i], 1000, 0); http_option = true; }
+             else if (arg == "--no-batching") { http.batching = false; http_option = true; }
++            else if (arg == "--threads" && i+1 < argc) laya::set_cpu_threads(number(argv[++i], 1024));
+             else if (arg == "--cpu") backend = laya::backend_type::cpu;
+             else if (arg == "--vulkan") backend = laya::backend_type::vulkan;
+             else if (arg == "--cuda") backend = laya::backend_type::cuda;
+@@ -53,7 +54,7 @@ int main(int argc, char** argv) {
+             else if (arg == "--prepare") prepare = true;
+             else if (arg == "--allow-truncation") allow_truncation = true;
+             else if (arg == "--help") {
+-                std::cout << "laya-cli [--model DIR] [--variant english|multilingual|typed-decisions] [--input JSON] [--raw|--prepare] [--allow-truncation] [--fp32|--fp16|--bf16] [--cpu|--cuda|--vulkan|--coreml]\n"
++                std::cout << "laya-cli [--model DIR] [--variant english|multilingual|typed-decisions] [--input JSON] [--raw|--prepare] [--allow-truncation] [--fp32|--fp16|--bf16] [--cpu|--cuda|--vulkan|--coreml] [--threads N]\n"
+                              "Requests that exceed model token budgets are rejected by default; --allow-truncation restores legacy truncation.\n"
+                              "--tensor-core-fp32 --flash-fp32 enables the optimized CUDA path.\n"
+                              "--bf16 enables mixed BF16 on CUDA or Vulkan; --fp16 currently requires Vulkan.\n--experimental-bf16 is a compatibility alias. See docs/precision.md and docs/vulkan.md for validated hardware and toolchains.\n"
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index 5c318a2..7a56f5b 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -21,6 +21,7 @@ const char* laya_cuda_bf16_compatibility_error();
+ #include "vulkan_status.hpp"
+ #endif
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <cstring>
+@@ -32,6 +33,10 @@ const char* laya_cuda_bf16_compatibility_error();
+ #include <stdexcept>
+ 
+ namespace laya {
++namespace { std::atomic<int> cpu_thread_count{0}; }
++void set_cpu_threads(int count) { cpu_thread_count = count > 0 ? count : 0; }
++int cpu_threads() { return cpu_thread_count; }
++
+ namespace {
+ using tensor = ggml_tensor;
+ using uint = uint32_t;
+@@ -139,7 +144,10 @@ struct runtime::impl {
+ #else
+         if (vulkan) throw std::runtime_error("This build has no Vulkan backend");
+ #endif
+-        if (selected == backend_type::cpu) backend = ggml_backend_cpu_init();
++        if (selected == backend_type::cpu) {
++            backend = ggml_backend_cpu_init();
++            if (backend && cpu_threads() > 0) ggml_backend_cpu_set_n_threads(backend, cpu_threads());
++        }
+         if (!backend) throw std::runtime_error("Cannot initialize requested backend");
+         const std::string device=ggml_backend_dev_description(ggml_backend_get_device(backend));
+         vulkan_nvidia=vulkan && device.find("NVIDIA")!=std::string::npos;
+diff --git a/tests/capi/make_synthetic_model.py b/tests/capi/make_synthetic_model.py
+new file mode 100644
+index 0000000..164a768
+--- /dev/null
++++ b/tests/capi/make_synthetic_model.py
+@@ -0,0 +1,146 @@
++#!/usr/bin/env python3
++"""Generate a synthetic Laya checkpoint for testing the C API without downloading weights.
++
++The checkpoint has the exact architecture laya.cpp validates (the "english" ModernBERT-large
++layout: width 1024, 28 layers, vocab 50368) and a real byte-level BPE tokenizer, but the
++weights are seeded random numbers. Answers are therefore meaningless; the checkpoint exists
++only to exercise loading, tokenization, the full forward pass and JSON formatting end to end.
++
++    python make_synthetic_model.py OUT_DIR [--seed 1234]
++Requires numpy and tokenizers (pip install numpy tokenizers). Writes ~830 MB (F16 weights).
++"""
++import argparse, json, os, struct
++import numpy as np
++
++WIDTH, HEADS, LAYERS, INTER, VOCAB = 1024, 16, 28, 2624, 50368
++ACT_COSTS = [0.0, 0.1, 0.2]  # three costs -> four action logits
++
++
++def tensor_specs():
++    w = WIDTH
++    yield "encoder.embeddings.tok_embeddings.weight", (VOCAB, w), "normal"
++    yield "encoder.embeddings.norm.weight", (w,), "ones"
++    yield "encoder.final_norm.weight", (w,), "ones"
++    yield "type_emb.weight", (3, w), "normal"
++    yield "temperature", (3,), "ones"
++    for i in range(LAYERS):
++        p = f"encoder.layers.{i}"
++        if i:
++            yield p + ".attn_norm.weight", (w,), "ones"
++        yield p + ".mlp_norm.weight", (w,), "ones"
++        yield p + ".attn.Wqkv.weight", (3 * w, w), "normal"
++        yield p + ".attn.Wo.weight", (w, w), "normal"
++        yield p + ".mlp.Wi.weight", (2 * INTER, w), "normal"
++        yield p + ".mlp.Wo.weight", (w, INTER), "normal"
++    for i in range(2):
++        p = f"head.layers.{i}"
++        yield p + ".self_attn.in_proj_weight", (3 * w, w), "normal"
++        yield p + ".self_attn.in_proj_bias", (3 * w,), "zeros"
++        yield p + ".self_attn.out_proj.weight", (w, w), "normal"
++        yield p + ".self_attn.out_proj.bias", (w,), "zeros"
++        yield p + ".linear1.weight", (4 * w, w), "normal"
++        yield p + ".linear1.bias", (4 * w,), "zeros"
++        yield p + ".linear2.weight", (w, 4 * w), "normal"
++        yield p + ".linear2.bias", (w,), "zeros"
++        for s in (".norm1.weight", ".norm2.weight"):
++            yield p + s, (w,), "ones"
++        for s in (".norm1.bias", ".norm2.bias"):
++            yield p + s, (w,), "zeros"
++    yield "scorer.0.weight", (w,), "ones"
++    yield "scorer.0.bias", (w,), "zeros"
++    yield "scorer.1.weight", (w, w), "normal"
++    yield "scorer.1.bias", (w,), "zeros"
++    yield "scorer.3.weight", (1, w), "normal"
++    yield "scorer.3.bias", (1,), "zeros"
++    yield "act_head.0.weight", (256, w + 4), "normal"
++    yield "act_head.0.bias", (256,), "zeros"
++    yield "act_head.2.weight", (len(ACT_COSTS) + 1, 256), "normal"
++    yield "act_head.2.bias", (len(ACT_COSTS) + 1,), "zeros"
++
++
++def write_safetensors(path, seed):
++    rng = np.random.default_rng(seed)
++    header, offset, specs = {}, 0, list(tensor_specs())
++    for name, shape, _ in specs:
++        n = int(np.prod(shape)) * 2
++        header[name] = {"dtype": "F16", "shape": list(shape), "data_offsets": [offset, offset + n]}
++        offset += n
++    header["__metadata__"] = {"format": "pt", "note": "synthetic laya test checkpoint"}
++    raw = json.dumps(header, separators=(",", ":")).encode()
++    raw += b" " * (-len(raw) % 8)
++    with open(path, "wb") as f:
++        f.write(struct.pack("<Q", len(raw)))
++        f.write(raw)
++        for name, shape, kind in specs:
++            if kind == "normal":
++                a = rng.standard_normal(shape, dtype=np.float32) * 0.02
++            elif kind == "ones":
++                a = np.ones(shape, np.float32)
++            else:
++                a = np.zeros(shape, np.float32)
++            f.write(a.astype("<f2").tobytes())
++
++
++def write_tokenizer(directory):
++    from tokenizers import Tokenizer, models, pre_tokenizers, trainers, normalizers, decoders
++    specials = ["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"]
++    tok = Tokenizer(models.BPE())
++    tok.normalizer = normalizers.NFC()
++    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)
++    tok.decoder = decoders.ByteLevel()
++    corpus = [
++        "Please refund the duplicate charge on my account.",
++        "Does the customer ask for a refund? yes, the statement holds",
++        "no, the statement does not hold. choice question: score question: noul question:",
++        "level 0: level 1: level 2: true: false: The quick brown fox jumps over the lazy dog.",
++        "Café naïve résumé Ünïcödé — 日本語 テキスト 中文 español português ação coração",
++        "I want to cancel my subscription and get my money back immediately!",
++    ] * 50
++    trainer = trainers.BpeTrainer(vocab_size=2000, special_tokens=specials,
++                                  initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), show_progress=False)
++    tok.train_from_iterator(corpus, trainer)
++    os.makedirs(directory, exist_ok=True)
++    path = os.path.join(directory, "tokenizer.json")
++    tok.save(path)
++    data = json.load(open(path, encoding="utf-8"))
++    data["normalizer"] = {"type": "NFC"}
++    data["model"]["dropout"] = None
++    data["model"]["byte_fallback"] = False
++    data["model"]["ignore_merges"] = False
++    data["model"]["merges"] = [m.split(" ") if isinstance(m, str) else m for m in data["model"]["merges"]]
++    for t in data["added_tokens"]:
++        t.update(single_word=False, rstrip=False, lstrip=False, normalized=False)
++    json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False)
++    json.dump({"cls_token": "[CLS]", "sep_token": "[SEP]", "pad_token": "[PAD]",
++               "mask_token": {"content": "[MASK]"}, "unk_token": "[UNK]"},
++              open(os.path.join(directory, "tokenizer_config.json"), "w"))
++
++
++def write_configs(out):
++    os.makedirs(os.path.join(out, "encoder"), exist_ok=True)
++    encoder = {
++        "model_type": "modernbert", "hidden_size": WIDTH, "num_attention_heads": HEADS,
++        "num_hidden_layers": LAYERS, "intermediate_size": INTER, "vocab_size": VOCAB,
++        "local_attention": 128, "global_attn_every_n_layers": 3, "norm_bias": False,
++        "attention_bias": False, "mlp_bias": False, "hidden_activation": "gelu", "norm_eps": 1e-5,
++        "layer_types": ["full_attention" if i % 3 == 0 else "sliding_attention" for i in range(LAYERS)],
++        "rope_parameters": {"full_attention": {"rope_type": "default", "rope_theta": 160000.0},
++                            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}},
++    }
++    json.dump(encoder, open(os.path.join(out, "encoder", "config.json"), "w"), indent=1)
++    agent = {"model_name": "laya-synthetic-test", "encoder": "answerdotai/ModernBERT-large",
++             "head_layers": 2, "amp_dtype": "bf16", "max_len": 512, "head_max_len": 192,
++             "act_costs": ACT_COSTS, "temperature": [1.0, 1.0, 1.0]}
++    json.dump(agent, open(os.path.join(out, "rl_agent_config.json"), "w"), indent=1)
++
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("out")
++    ap.add_argument("--seed", type=int, default=1234)
++    args = ap.parse_args()
++    os.makedirs(args.out, exist_ok=True)
++    write_configs(args.out)
++    write_tokenizer(os.path.join(args.out, "tokenizer"))
++    write_safetensors(os.path.join(args.out, "model.safetensors"), args.seed)
++    print("synthetic checkpoint written to", args.out)
+diff --git a/tests/capi/test_capi.c b/tests/capi/test_capi.c
+new file mode 100644
+index 0000000..8aeae71
+--- /dev/null
++++ b/tests/capi/test_capi.c
+@@ -0,0 +1,303 @@
++/* test_capi.c - tests for the laya C ABI (laya.dll / liblaya.so).
++ *
++ * Plain C11 on purpose: it proves the header is consumable from C and exercises the library the
++ * way an FFI host (Delphi, C#, ...) does. Runs on Linux and Windows (also under Wine).
++ *
++ *   test-capi                      API-contract tests that need no model
++ *   LAYA_TEST_MODEL=dir test-capi  + end-to-end inference tests on a checkpoint
++ *   LAYA_TEST_DUMP=file            also write the reference predictions there (for cross-platform
++ *                                  and laya-cli parity checks, see test_parity.py)
++ *   LAYA_TEST_BACKEND=cpu|cuda|vulkan (default cpu)
++ * Exit code: 0 pass, 1 failure, 77 model tests skipped (contract tests still passed).
++ */
++#ifndef _WIN32
++#define _GNU_SOURCE /* feenableexcept */
++#endif
++#include "laya_c.h"
++
++#include <fenv.h>
++#include <float.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#ifdef _WIN32
++#include <windows.h>
++typedef HANDLE thread_t;
++typedef DWORD(WINAPI* thread_fn)(void*);
++#define THREAD_RET DWORD WINAPI
++static int thread_start(thread_t* t, thread_fn fn, void* arg) { *t = CreateThread(NULL, 0, fn, arg, 0, NULL); return *t ? 0 : -1; }
++static void thread_join(thread_t t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
++#else
++#include <pthread.h>
++typedef pthread_t thread_t;
++typedef void* (*thread_fn)(void*);
++#define THREAD_RET void*
++static int thread_start(thread_t* t, thread_fn fn, void* arg) { return pthread_create(t, NULL, fn, arg); }
++static void thread_join(thread_t t) { pthread_join(t, NULL); }
++#endif
++
++/* Emulate Delphi/Free Pascal hosts, which unmask invalid/zero-divide/overflow FP exceptions. */
++static void unmask_fp_exceptions(void) {
++#ifdef _WIN32
++    unsigned int cw;
++    _controlfp_s(&cw, 0, 0);
++    _controlfp_s(&cw, cw & ~(unsigned)(_EM_INVALID | _EM_ZERODIVIDE | _EM_OVERFLOW), _MCW_EM);
++#else
++    feenableexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
++#endif
++}
++static unsigned fp_exception_state(void) {
++#ifdef _WIN32
++    unsigned int cw;
++    _controlfp_s(&cw, 0, 0);
++    return cw & _MCW_EM;
++#else
++    return (unsigned)fegetexcept();
++#endif
++}
++
++static int failures = 0, checks = 0;
++#define CHECK(cond, ...)                                                       \
++    do {                                                                       \
++        ++checks;                                                              \
++        if (!(cond)) {                                                         \
++            ++failures;                                                        \
++            fprintf(stderr, "FAIL %s:%d: %s -- ", __FILE__, __LINE__, #cond); \
++            fprintf(stderr, __VA_ARGS__);                                      \
++            fputc('\n', stderr);                                               \
++        }                                                                      \
++    } while (0)
++
++static int contains(const char* text, const char* needle) { return text && strstr(text, needle) != NULL; }
++static int is_error(const char* json) { return json && strncmp(json, "{\"error\":", 9) == 0; }
++
++/* The "results" member only (drops elapsed_ms, which varies run to run). Caller frees. */
++static char* results_of(const char* json) {
++    const char* start = json ? strstr(json, "\"results\":") : NULL;
++    const char* end = start ? strstr(start, ",\"elapsed_ms\":") : NULL;
++    if (!start || !end) return NULL;
++    size_t n = (size_t)(end - start);
++    char* out = (char*)malloc(n + 1);
++    memcpy(out, start, n);
++    out[n] = 0;
++    return out;
++}
++
++static char* predict_results(laya_agent* agent, const char* request) {
++    char* json = laya_predict(agent, request);
++    char* results = results_of(json);
++    if (!results) fprintf(stderr, "  predict returned: %s\n", json ? json : "(null)");
++    laya_free_string(json);
++    return results;
++}
++
++/* ---------------------------------------------------------------- contract tests (no model) */
++
++static int log_calls = 0;
++static void LAYA_CALL count_log(int level, const char* text, void* user) {
++    (void)level; (void)text;
++    if (user == &log_calls) ++log_calls;
++}
++
++static void test_contract(void) {
++    const char* v = laya_version();
++    CHECK(v && strncmp(v, "laya_c ", 7) == 0, "version=%s", v ? v : "(null)");
++    CHECK(laya_api_version() == LAYA_C_API_VERSION, "api=%d", laya_api_version());
++    printf("library: %s\n", v);
++
++    CHECK(laya_create(NULL, NULL) == NULL, "NULL dir must fail");
++    CHECK(contains(laya_last_error(), "model_dir"), "err=%s", laya_last_error());
++    CHECK(laya_create("", NULL) == NULL, "empty dir must fail");
++
++    CHECK(laya_create("/definitely/not/here", NULL) == NULL, "missing dir must fail");
++    CHECK(contains(laya_last_error(), "rl_agent_config.json"), "err=%s", laya_last_error());
++
++    const char* bad_options[][2] = {
++        {"{not json", "parse"},
++        {"[1,2]", "JSON object"},
++        {"{\"bogus\":1}", "Unknown option: bogus"},
++        {"{\"backend\":\"tpu\"}", "Unknown backend"},
++        {"{\"precision\":\"int4\"}", "Unknown precision"},
++        {"{\"variant\":\"klingon\"}", "Unknown model variant"},
++        {"{\"threads\":-2}", "threads"},
++    };
++    for (size_t i = 0; i < sizeof bad_options / sizeof bad_options[0]; ++i) {
++        CHECK(laya_create("/definitely/not/here", bad_options[i][0]) == NULL, "options %s", bad_options[i][0]);
++        CHECK(contains(laya_last_error(), bad_options[i][1]), "options %s -> err=%s", bad_options[i][0], laya_last_error());
++    }
++
++    char* r = laya_predict(NULL, "{}");
++    CHECK(is_error(r) && contains(r, "agent is NULL"), "predict(NULL)=%s", r ? r : "(null)");
++    CHECK(contains(laya_last_error(), "agent is NULL"), "err=%s", laya_last_error());
++    laya_free_string(r);
++    r = laya_prepare(NULL, "{}");
++    CHECK(is_error(r), "prepare(NULL)=%s", r ? r : "(null)");
++    laya_free_string(r);
++    r = laya_info(NULL);
++    CHECK(is_error(r), "info(NULL)=%s", r ? r : "(null)");
++    laya_free_string(r);
++    laya_free_string(NULL);
++    laya_destroy(NULL);
++
++    /* A successful call clears the thread's last error. */
++    (void)laya_create(NULL, NULL);
++    r = laya_predict(NULL, "{}");
++    laya_free_string(r);
++    CHECK(strlen(laya_last_error()) > 0, "error expected");
++
++    laya_set_log_callback(count_log, &log_calls, 1);
++    laya_set_log_callback(NULL, NULL, 0);
++}
++
++/* ---------------------------------------------------------------- model tests */
++
++static const char* REQ_NOUL =
++    "{\"state\":\"Please refund the duplicate charge.\",\"questions\":{\"refund\":{\"type\":\"noul\","
++    "\"instructions\":\"Does the customer ask for a refund?\"}}}";
++static const char* REQ_BATCH =
++    "[{\"state\":\"I want to cancel my subscription.\",\"questions\":{"
++    "\"intent\":{\"type\":\"choice\",\"instructions\":\"What does the customer want?\",\"criteria\":[\"cancel\",\"upgrade\",\"refund\"]},"
++    "\"anger\":{\"type\":\"score\",\"instructions\":\"How angry is the customer?\",\"criteria\":[\"calm\",\"annoyed\",\"furious\"]}}},"
++    "{\"state\":{\"ticket\":42,\"text\":\"Caf\xC3\xA9 na\xC3\xAFve \xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E \xE2\x80\x94 money back now!\"},"
++    "\"questions\":{\"refund\":{\"type\":\"noul\",\"instructions\":\"Does the customer ask for a refund?\","
++    "\"criteria\":{\"true\":\"asks for money back\",\"false\":\"does not\"}}}}]";
++
++typedef struct { laya_agent* agent; const char* reference; int runs, mismatches; } worker_arg;
++
++static THREAD_RET worker(void* p) {
++    worker_arg* w = (worker_arg*)p;
++    for (int i = 0; i < w->runs; ++i) {
++        char* got = predict_results(w->agent, REQ_BATCH);
++        if (!got || strcmp(got, w->reference) != 0) ++w->mismatches;
++        free(got);
++    }
++    return 0;
++}
++
++static void test_model(const char* model, const char* backend, const char* dump_path) {
++    char options[128];
++    snprintf(options, sizeof options, "{\"backend\":\"%s\"}", backend);
++    laya_agent* agent = laya_create(model, options);
++    CHECK(agent != NULL, "create(%s): %s", model, laya_last_error());
++    if (!agent) return;
++
++    char* info = laya_info(agent);
++    CHECK(info && contains(info, "\"backend\":") && contains(info, "\"max_len\":"), "info=%s", info ? info : "(null)");
++    printf("info: %s\n", info ? info : "(null)");
++    laya_free_string(info);
++
++    /* single boolean question */
++    char* full = laya_predict(agent, REQ_NOUL);
++    CHECK(full && !is_error(full), "noul: %s", full ? full : "(null)");
++    CHECK(contains(full, "\"refund\":{\"type\":\"noul\"") && contains(full, "\"noul\":") &&
++          contains(full, "\"act_probability\":") && contains(full, "\"elapsed_ms\":"), "noul shape: %s", full ? full : "(null)");
++    printf("noul: %s\n", full ? full : "(null)");
++    laya_free_string(full);
++
++    /* batch of two requests, choice + score + noul with criteria, nested JSON state, UTF-8 */
++    char* reference = predict_results(agent, REQ_BATCH);
++    CHECK(reference != NULL, "batch failed");
++    if (reference) {
++        CHECK(contains(reference, "\"choice\":") && contains(reference, "\"score\":") && contains(reference, "\"legend\":"),
++              "batch shape: %s", reference);
++        CHECK(contains(reference, "\"probabilities\":{\"cancel\":"), "choice keys: %s", reference);
++        const char* second = strstr(reference, "},{\"model\"");
++        CHECK(second && contains(second, "\"refund\""), "second request answered: %s", reference);
++    }
++
++    /* determinism: same input, same output */
++    char* again = predict_results(agent, REQ_BATCH);
++    CHECK(reference && again && strcmp(reference, again) == 0, "nondeterministic:\n%s\n%s", reference ? reference : "(null)", again ? again : "(null)");
++    free(again);
++
++    /* prepare */
++    char* prep = laya_prepare(agent, REQ_NOUL);
++    CHECK(prep && contains(prep, "\"ids\":[") && contains(prep, "\"batch\":1"), "prepare: %.200s", prep ? prep : "(null)");
++    laya_free_string(prep);
++
++    /* bad requests produce {"error":...} and leave the agent usable */
++    const char* bad_requests[][2] = {
++        {"{oops", "parse"},
++        {"[]", "nonempty array"},
++        {"{\"questions\":{\"a\":{\"type\":\"noul\",\"instructions\":\"x\"}}}", "state"},
++        {"{\"state\":\"x\",\"questions\":{}}", "nonempty object"},
++        {"{\"state\":\"x\",\"questions\":{\"a\":{\"type\":\"essay\",\"instructions\":\"x\"}}}", "Unsupported question type"},
++        {"{\"state\":\"x\",\"questions\":{\"a\":{\"type\":\"choice\",\"instructions\":\"x\",\"criteria\":[\"only\"]}}}", "2 through 255"},
++    };
++    for (size_t i = 0; i < sizeof bad_requests / sizeof bad_requests[0]; ++i) {
++        char* r = laya_predict(agent, bad_requests[i][0]);
++        CHECK(is_error(r) && contains(r, bad_requests[i][1]), "request %s -> %s", bad_requests[i][0], r ? r : "(null)");
++        laya_free_string(r);
++    }
++    {
++        char* r = laya_predict(agent, NULL);
++        CHECK(is_error(r) && contains(laya_last_error(), "NULL"), "NULL request -> %s", r ? r : "(null)");
++        laya_free_string(r);
++    }
++
++    /* over-long state is rejected (no silent truncation) */
++    {
++        size_t n = 20000;
++        char* request = (char*)malloc(n + 200);
++        strcpy(request, "{\"state\":\"");
++        size_t len = strlen(request);
++        for (size_t i = 0; i < n; i += 5) memcpy(request + len + i, "word ", 5);
++        strcpy(request + len + n, "\",\"questions\":{\"q\":{\"type\":\"noul\",\"instructions\":\"long?\"}}}");
++        char* r = laya_predict(agent, request);
++        CHECK(is_error(r) && contains(r, "exceeds state context limit"), "long state -> %.200s", r ? r : "(null)");
++        laya_free_string(r);
++        free(request);
++    }
++    char* after = predict_results(agent, REQ_BATCH);
++    CHECK(reference && after && strcmp(reference, after) == 0, "agent changed after errors");
++    free(after);
++
++    /* concurrency: four threads share one agent; every answer must equal the reference */
++    if (reference) {
++        enum { N = 4 };
++        worker_arg args[N];
++        thread_t threads[N];
++        for (int i = 0; i < N; ++i) {
++            args[i] = (worker_arg){agent, reference, 3, 0};
++            CHECK(thread_start(&threads[i], worker, &args[i]) == 0, "thread start");
++        }
++        int mismatches = 0;
++        for (int i = 0; i < N; ++i) { thread_join(threads[i]); mismatches += args[i].mismatches; }
++        CHECK(mismatches == 0, "%d concurrent results differed", mismatches);
++    }
++
++    if (dump_path && reference) {
++        FILE* f = fopen(dump_path, "wb");
++        CHECK(f != NULL, "cannot write %s", dump_path);
++        if (f) { fputs(reference, f); fclose(f); }
++    }
++    free(reference);
++    laya_destroy(agent);
++
++    /* reload after destroy, with explicit thread count and the variant option */
++    snprintf(options, sizeof options, "{\"backend\":\"%s\",\"threads\":1,\"variant\":\"english\"}", backend);
++    agent = laya_create(model, options);
++    CHECK(agent != NULL, "re-create: %s", laya_last_error());
++    char* single = agent ? predict_results(agent, REQ_NOUL) : NULL;
++    CHECK(single && contains(single, "\"noul\":"), "re-created agent predict");
++    free(single);
++    laya_destroy(agent);
++}
++
++int main(void) {
++    test_contract();
++    const char* model = getenv("LAYA_TEST_MODEL");
++    const char* backend = getenv("LAYA_TEST_BACKEND");
++    int skipped = !model || !*model;
++    if (!skipped) {
++        /* Run like a Delphi host would; the library must neither trap nor change our FP state. */
++        unmask_fp_exceptions();
++        unsigned before = fp_exception_state();
++        test_model(model, backend && *backend ? backend : "cpu", getenv("LAYA_TEST_DUMP"));
++        CHECK(fp_exception_state() == before, "caller FP exception mask changed: %#x -> %#x", before, fp_exception_state());
++    }
++    printf("%d checks, %d failures%s\n", checks, failures, skipped ? " (model tests skipped: set LAYA_TEST_MODEL)" : "");
++    return failures ? 1 : skipped ? 77 : 0;
++}
+diff --git a/tests/capi/test_parity.py b/tests/capi/test_parity.py
+new file mode 100644
+index 0000000..a97709c
+--- /dev/null
++++ b/tests/capi/test_parity.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++"""Parity test: the C ABI library must answer exactly like laya-cli for the same checkpoint.
++
++    python test_parity.py --lib build/bin/liblaya.so --cli build/bin/laya-cli --model MODEL_DIR
++           [--backend cpu] [--compare-dump other_platform_dump.json]
++
++Runs a set of requests through both, compares the "results" members byte for byte, and
++optionally compares against a dump written by test-capi on another platform (LAYA_TEST_DUMP),
++e.g. the Windows laya.dll run under Wine.
++"""
++import argparse, ctypes, json, subprocess, sys
++
++REQUESTS = [
++    {"state": "Please refund the duplicate charge.",
++     "questions": {"refund": {"type": "noul", "instructions": "Does the customer ask for a refund?"}}},
++    {"state": "I want to cancel my subscription.",
++     "questions": {"intent": {"type": "choice", "instructions": "What does the customer want?",
++                              "criteria": ["cancel", "upgrade", "refund"]},
++                   "anger": {"type": "score", "instructions": "How angry is the customer?",
++                             "criteria": ["calm", "annoyed", "furious"]}}},
++    {"state": {"ticket": 42, "text": "Café naïve 日本語 — money back now!"},
++     "questions": {"refund": {"type": "noul", "instructions": "Does the customer ask for a refund?",
++                              "criteria": {"true": "asks for money back", "false": "does not"}}}},
++    {"state": "Order #1182 arrived broken; the box was crushed.",
++     "questions": {"category": {"type": "choice", "instructions": "Ticket category",
++                                "criteria": {"damage": "item arrived damaged", "late": "delivery is late",
++                                             "billing": None, "other": ""}}}},
++]
++# Same batch test-capi uses for its dump (request order and content must match exactly).
++DUMP_BATCH = [
++    {"state": "I want to cancel my subscription.",
++     "questions": {"intent": {"type": "choice", "instructions": "What does the customer want?",
++                              "criteria": ["cancel", "upgrade", "refund"]},
++                   "anger": {"type": "score", "instructions": "How angry is the customer?",
++                             "criteria": ["calm", "annoyed", "furious"]}}},
++    {"state": {"ticket": 42, "text": "Café naïve 日本語 — money back now!"},
++     "questions": {"refund": {"type": "noul", "instructions": "Does the customer ask for a refund?",
++                              "criteria": {"true": "asks for money back", "false": "does not"}}}},
++]
++
++
++def load(path):
++    lib = ctypes.CDLL(path)
++    lib.laya_create.restype = ctypes.c_void_p
++    lib.laya_create.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
++    lib.laya_predict.restype = ctypes.c_void_p
++    lib.laya_predict.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
++    lib.laya_free_string.argtypes = [ctypes.c_void_p]
++    lib.laya_destroy.argtypes = [ctypes.c_void_p]
++    lib.laya_last_error.restype = ctypes.c_char_p
++    return lib
++
++
++def lib_predict(lib, agent, request):
++    p = lib.laya_predict(agent, json.dumps(request, ensure_ascii=False).encode())
++    text = ctypes.string_at(p).decode()
++    lib.laya_free_string(p)
++    return json.loads(text)
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--lib", required=True)
++    ap.add_argument("--cli", required=True)
++    ap.add_argument("--model", required=True)
++    ap.add_argument("--backend", default="cpu")
++    ap.add_argument("--compare-dump")
++    a = ap.parse_args()
++
++    lib = load(a.lib)
++    agent = lib.laya_create(a.model.encode(), json.dumps({"backend": a.backend}).encode())
++    if not agent:
++        sys.exit("laya_create failed: " + lib.laya_last_error().decode())
++
++    batches = [[r] for r in REQUESTS] + [REQUESTS, DUMP_BATCH]
++    lines = "\n".join(json.dumps(b, ensure_ascii=False) for b in batches) + "\n"
++    cli = subprocess.run([a.cli, "--model", a.model, "--" + a.backend], input=lines.encode(),
++                         capture_output=True, check=True)
++    cli_out = [json.loads(line) for line in cli.stdout.decode().splitlines() if line.strip()]
++    failures = 0
++    for i, (batch, expected) in enumerate(zip(batches, cli_out)):
++        got = lib_predict(lib, agent, batch)
++        same = got.get("results") == expected.get("results")
++        failures += not same
++        print(f"batch {i}: {'OK ' if same else 'DIFF'} {json.dumps(got.get('results'), ensure_ascii=False)[:110]}")
++        if not same:
++            print("  cli :", json.dumps(expected, ensure_ascii=False))
++            print("  lib :", json.dumps(got, ensure_ascii=False))
++
++    if a.compare_dump:
++        other = json.loads("{" + open(a.compare_dump, encoding="utf-8").read() + "}")["results"]
++        same = other == cli_out[-1]["results"]
++        failures += not same
++        print(f"cross-platform dump {a.compare_dump}: {'OK' if same else 'DIFF'}")
++        if not same:
++            print("  dump:", json.dumps(other, ensure_ascii=False))
++            print("  cli :", json.dumps(cli_out[-1]["results"], ensure_ascii=False))
++
++    lib.laya_destroy(agent)
++    print("PASS" if not failures else f"FAIL ({failures})")
++    sys.exit(1 if failures else 0)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+

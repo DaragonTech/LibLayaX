@@ -1,0 +1,36 @@
+From d961b63dc5da803bbd31f2582838feb6cc4d9a68 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 2 Oct 2026 01:07:26 +0100
+Subject: [PATCH 27/30] Credits: Laya (NandhaKishorM), laya.cpp (Lars
+ Karlslund), Claude, Felipe Daragon / DaragonTech
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/README.md | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/capi/README.md b/capi/README.md
+index 3568497..b950431 100644
+--- a/capi/README.md
++++ b/capi/README.md
+@@ -125,3 +125,16 @@ on real hardware (Windows 11 on ARM under Parallels, Apple M3 Ultra):
+   arithmetic, call_once, mutexes, exceptions, threads). No library, no model; each step is
+   announced before it runs.
+ * `delphi/LayaTests.dpr`: the same kind of tests through the Delphi binding.
++
++## Credits
++
++* **[Laya](https://github.com/NandhaKishorM/laya)** by NandhaKishorM is the original project:
++  the model, the typed-decision primitives (`choice`, `score`, `noul`) and the Python
++  reference implementation on PyTorch and Transformers. Apache-2.0. The weights are published
++  on Hugging Face under `convaiinnovations`.
++* **[laya.cpp](https://github.com/lkarlslund/laya.cpp)** by Lars Karlslund is the native C++
++  port of Laya inference, built on ggml, with CPU, CUDA, Vulkan and Core ML backends. MIT.
++  This library is a layer on top of it.
++* **The C API**, its tests, tools and build scripts were written by Claude (Anthropic), under
++  the direction of **Felipe Daragon** of **DaragonTech**, who set the goals, guided the work
++  and ran every test on real Windows and Mac hardware.
+-- 
+2.43.0
+

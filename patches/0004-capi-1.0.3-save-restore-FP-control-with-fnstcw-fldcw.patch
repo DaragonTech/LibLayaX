@@ -1,0 +1,96 @@
+From cc84c38a9a44dd87480203025eabca6a859bee41 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 18:05:34 +0100
+Subject: [PATCH 04/30] capi 1.0.3: save/restore FP control with fnstcw/fldcw +
+ MXCSR; per-register FP checks in tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/laya_c.cpp        | 20 +++++++++++---------
+ tests/capi/test_capi.c | 24 ++++++++++++++++++++++--
+ 2 files changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index be39e73..f0054d4 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -57,21 +57,23 @@ thread_local std::string last_error;
+ // unmasked, and SSE is what ggml uses on x86-64, so MXCSR is handled explicitly.
+ struct fp_guard {
+ #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+-    // Save and restore the registers directly rather than through <cfenv>: MinGW's fenv
+-    // functions go through the C runtime, and on real Windows they did not restore the
+-    // caller's x87 control word.
+-    unsigned char x87[28];  // FNSTENV image: control word, status word (flags), tags, pointers
++    // Save and restore the control registers directly rather than through <cfenv> (MinGW's fenv
++    // goes through the C runtime) and with the simplest instructions (fnstcw/fldcw rather than
++    // fnstenv/fldenv), which emulators such as Windows-on-ARM's Prism also handle faithfully.
++    unsigned short cw;
+     unsigned int csr;
+     fp_guard() {
+-        __asm__ volatile("fnstenv %0" : "=m"(x87));  // also masks all x87 exceptions
+-        __asm__ volatile("fnclex");
++        __asm__ volatile("fnstcw %0" : "=m"(cw));
+         __asm__ volatile("stmxcsr %0" : "=m"(csr));
+-        unsigned int masked = (csr | 0x1F80u) & ~0x3Fu;  // mask all six SSE exceptions, clear flags
+-        __asm__ volatile("ldmxcsr %0" : : "m"(masked));
++        unsigned short masked_cw = cw | 0x3F;               // mask all six x87 exceptions
++        unsigned int masked_csr = (csr | 0x1F80u) & ~0x3Fu;  // mask all six SSE exceptions, clear flags
++        __asm__ volatile("fnclex");
++        __asm__ volatile("fldcw %0" : : "m"(masked_cw));
++        __asm__ volatile("ldmxcsr %0" : : "m"(masked_csr));
+     }
+     ~fp_guard() {
+         __asm__ volatile("fnclex");  // drop flags raised while masked so restoring cannot trap
+-        __asm__ volatile("fldenv %0" : : "m"(x87));
++        __asm__ volatile("fldcw %0" : : "m"(cw));
+         __asm__ volatile("ldmxcsr %0" : : "m"(csr));
+     }
+ #elif defined(_M_X64)
+diff --git a/tests/capi/test_capi.c b/tests/capi/test_capi.c
+index 8aeae71..f244a0c 100644
+--- a/tests/capi/test_capi.c
++++ b/tests/capi/test_capi.c
+@@ -48,6 +48,21 @@ static void unmask_fp_exceptions(void) {
+     feenableexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+ #endif
+ }
++/* Raw control registers, to tell an x87 from an SSE problem. */
++static unsigned x87_control(void) {
++#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
++    unsigned short cw; __asm__ volatile("fnstcw %0" : "=m"(cw)); return cw;
++#else
++    return 0;
++#endif
++}
++static unsigned sse_control(void) {
++#if defined(__GNUC__) && defined(__x86_64__)
++    unsigned csr; __asm__ volatile("stmxcsr %0" : "=m"(csr)); return csr & ~0x3Fu; /* ignore sticky flags */
++#else
++    return 0;
++#endif
++}
+ static unsigned fp_exception_state(void) {
+ #ifdef _WIN32
+     unsigned int cw;
+@@ -294,9 +309,14 @@ int main(void) {
+     if (!skipped) {
+         /* Run like a Delphi host would; the library must neither trap nor change our FP state. */
+         unmask_fp_exceptions();
+-        unsigned before = fp_exception_state();
++        unsigned before = fp_exception_state(), x87_before = x87_control(), sse_before = sse_control();
+         test_model(model, backend && *backend ? backend : "cpu", getenv("LAYA_TEST_DUMP"));
+-        CHECK(fp_exception_state() == before, "caller FP exception mask changed: %#x -> %#x", before, fp_exception_state());
++        unsigned x87_after = x87_control(), sse_after = sse_control();
++        printf("fp state: crt %#x -> %#x, x87 cw %#x -> %#x, mxcsr %#x -> %#x\n", before, fp_exception_state(),
++               x87_before, x87_after, sse_before, sse_after);
++        /* SSE (MXCSR) is what 64-bit compilers, Delphi Win64 included, use for floating point. */
++        CHECK(sse_after == sse_before, "caller MXCSR changed: %#x -> %#x", sse_before, sse_after);
++        CHECK(x87_after == x87_before, "caller x87 control word changed: %#x -> %#x", x87_before, x87_after);
+     }
+     printf("%d checks, %d failures%s\n", checks, failures, skipped ? " (model tests skipped: set LAYA_TEST_MODEL)" : "");
+     return failures ? 1 : skipped ? 77 : 0;
+-- 
+2.43.0
+

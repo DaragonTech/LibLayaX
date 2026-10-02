@@ -1,0 +1,343 @@
+From f02e5a3011c6b847cc23661b7a52b1f825b4b5ef Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 23:43:27 +0100
+Subject: [PATCH 21/30] ARM64: Linux aarch64 and native Windows ARM64 builds
+ with Zig
+
+- toolchain files zig-linux-aarch64 / zig-windows-aarch64, scripts/capi/build-arm64.sh
+- Linux: hide symbols with a version script (works with zig's linker too)
+- capi CMake: MinGW-GCC-only link flags; test-capi quick mode for emulators
+- run-tests.bat skips LayaTests.exe when absent
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt                         | 22 +++++--
+ capi/linux-exports.map                      |  5 ++
+ cmake/toolchains/zig-linux-aarch64.cmake    | 18 ++++++
+ cmake/toolchains/zig-windows-aarch64.cmake  | 12 ++++
+ cmake/toolchains/zig/zigcc                  |  4 +-
+ cmake/toolchains/zig/zigcc-aarch64-linux    |  1 +
+ cmake/toolchains/zig/zigcc-aarch64-windows  |  1 +
+ cmake/toolchains/zig/zigcxx                 |  4 +-
+ cmake/toolchains/zig/zigcxx-aarch64-linux   |  1 +
+ cmake/toolchains/zig/zigcxx-aarch64-windows |  1 +
+ scripts/capi/build-arm64.sh                 | 65 +++++++++++++++++++++
+ scripts/capi/run-tests.bat                  |  4 ++
+ tests/capi/test_capi.c                      |  3 +-
+ 13 files changed, 133 insertions(+), 8 deletions(-)
+ create mode 100644 capi/linux-exports.map
+ create mode 100644 cmake/toolchains/zig-linux-aarch64.cmake
+ create mode 100644 cmake/toolchains/zig-windows-aarch64.cmake
+ create mode 120000 cmake/toolchains/zig/zigcc-aarch64-linux
+ create mode 120000 cmake/toolchains/zig/zigcc-aarch64-windows
+ create mode 120000 cmake/toolchains/zig/zigcxx-aarch64-linux
+ create mode 120000 cmake/toolchains/zig/zigcxx-aarch64-windows
+ create mode 100755 scripts/capi/build-arm64.sh
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index 7cad557..c5d34df 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -32,9 +32,16 @@ set_target_properties(laya_c PROPERTIES
+ if(WIN32)
+   set_target_properties(laya_c PROPERTIES PREFIX "")  # laya.dll, not liblaya.dll
+ endif()
+-if(MINGW)
++# MinGW GCC needs its runtime folded in explicitly; clang/zig for Windows links libc++ statically
++# already and exports only the dllexport functions.
++set(LAYA_MINGW_GCC OFF)
++if(MINGW AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++  set(LAYA_MINGW_GCC ON)
++endif()
++if(LAYA_MINGW_GCC)
+   # A Delphi/.NET host has no MinGW runtime: fold libgcc, libstdc++ and winpthread into the DLL.
+   target_link_options(laya_c PRIVATE -static-libgcc -static-libstdc++ -static -Wl,--exclude-all-symbols)
++elseif(WIN32)
+ elseif(APPLE)
+   # Found next to the app via @rpath (e.g. Contents/MacOS or Contents/Frameworks), exporting only
+   # the C API. Apple's linker honours the list; the zig cross build relinks with ld64.lld
+@@ -42,15 +49,18 @@ elseif(APPLE)
+   set_target_properties(laya_c PROPERTIES INSTALL_NAME_DIR "@rpath" BUILD_WITH_INSTALL_NAME_DIR ON)
+   target_link_options(laya_c PRIVATE -Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/macos-exports.txt -Wl,-dead_strip)
+ elseif(UNIX)
+-  target_link_options(laya_c PRIVATE -Wl,--exclude-libs,ALL -Wl,--no-undefined)
++  # A version script (rather than --exclude-libs) hides everything but the C API with GNU ld,
++  # lld and zig alike, including symbols of the statically linked C++ runtime and ICU.
++  target_link_options(laya_c PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/linux-exports.map -Wl,--no-undefined)
+ endif()
+ 
+ if(BUILD_TESTING)
+   add_executable(test-capi ${CMAKE_SOURCE_DIR}/tests/capi/test_capi.c)
+   set_target_properties(test-capi PROPERTIES C_STANDARD 11 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+   target_link_libraries(test-capi PRIVATE laya_c)
+-  if(MINGW)
++  if(LAYA_MINGW_GCC)
+     target_link_options(test-capi PRIVATE -static)
++  elseif(WIN32)
+   elseif(APPLE)
+     set_target_properties(test-capi PROPERTIES BUILD_RPATH "@executable_path")
+   elseif(UNIX)
+@@ -60,16 +70,18 @@ if(BUILD_TESTING)
+   add_executable(laya-bench ${CMAKE_SOURCE_DIR}/tests/capi/bench_capi.c)
+   set_target_properties(laya-bench PROPERTIES C_STANDARD 11 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+   target_link_libraries(laya-bench PRIVATE laya_c)
+-  if(MINGW)
++  if(LAYA_MINGW_GCC)
+     target_link_options(laya-bench PRIVATE -static)
++  elseif(WIN32)
+   elseif(APPLE)
+     set_target_properties(laya-bench PROPERTIES BUILD_RPATH "@executable_path")
+   endif()
+   add_executable(laya-diag ${CMAKE_SOURCE_DIR}/tests/capi/diag_capi.c)
+   set_target_properties(laya-diag PROPERTIES C_STANDARD 11 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+   target_link_libraries(laya-diag PRIVATE laya_c)
+-  if(MINGW)
++  if(LAYA_MINGW_GCC)
+     target_link_options(laya-diag PRIVATE -static)
++  elseif(WIN32)
+   elseif(APPLE)
+     set_target_properties(laya-diag PROPERTIES BUILD_RPATH "@executable_path")
+   endif()
+diff --git a/capi/linux-exports.map b/capi/linux-exports.map
+new file mode 100644
+index 0000000..4c870ca
+--- /dev/null
++++ b/capi/linux-exports.map
+@@ -0,0 +1,5 @@
++/* Only the C API is exported from liblaya.so. */
++{
++  global: laya_*;
++  local: *;
++};
+diff --git a/cmake/toolchains/zig-linux-aarch64.cmake b/cmake/toolchains/zig-linux-aarch64.cmake
+new file mode 100644
+index 0000000..42605c6
+--- /dev/null
++++ b/cmake/toolchains/zig-linux-aarch64.cmake
+@@ -0,0 +1,18 @@
++# Cross-compile Linux ARM64 (aarch64, glibc >= 2.28) binaries from any host with Zig.
++#   cmake -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/zig-linux-aarch64.cmake ...
++# Baseline: ARMv8.0-A with NEON (Raspberry Pi 4/5, AWS Graviton, Ampere, ...). libc++ is linked in.
++set(CMAKE_SYSTEM_NAME Linux)
++set(CMAKE_SYSTEM_PROCESSOR aarch64)
++set(CMAKE_C_COMPILER   ${CMAKE_CURRENT_LIST_DIR}/zig/zigcc-aarch64-linux)
++set(CMAKE_CXX_COMPILER ${CMAKE_CURRENT_LIST_DIR}/zig/zigcxx-aarch64-linux)
++set(CMAKE_AR           ${CMAKE_CURRENT_LIST_DIR}/zig/zigar CACHE FILEPATH "")
++set(CMAKE_RANLIB       ${CMAKE_CURRENT_LIST_DIR}/zig/zigranlib CACHE FILEPATH "")
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
++set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
++# Run cross-built tests through QEMU user emulation when available.
++find_program(QEMU_AARCH64 NAMES qemu-aarch64-static qemu-aarch64)
++if(QEMU_AARCH64 AND EXISTS /usr/aarch64-linux-gnu)
++  set(CMAKE_CROSSCOMPILING_EMULATOR ${QEMU_AARCH64} -L /usr/aarch64-linux-gnu)
++endif()
+diff --git a/cmake/toolchains/zig-windows-aarch64.cmake b/cmake/toolchains/zig-windows-aarch64.cmake
+new file mode 100644
+index 0000000..5b18c50
+--- /dev/null
++++ b/cmake/toolchains/zig-windows-aarch64.cmake
+@@ -0,0 +1,12 @@
++# Cross-compile native Windows ARM64 binaries from any host with Zig (bundled MinGW-w64 + libc++).
++#   cmake -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/zig-windows-aarch64.cmake ...
++set(CMAKE_SYSTEM_NAME Windows)
++set(CMAKE_SYSTEM_PROCESSOR ARM64)
++set(CMAKE_C_COMPILER   ${CMAKE_CURRENT_LIST_DIR}/zig/zigcc-aarch64-windows)
++set(CMAKE_CXX_COMPILER ${CMAKE_CURRENT_LIST_DIR}/zig/zigcxx-aarch64-windows)
++set(CMAKE_AR           ${CMAKE_CURRENT_LIST_DIR}/zig/zigar CACHE FILEPATH "")
++set(CMAKE_RANLIB       ${CMAKE_CURRENT_LIST_DIR}/zig/zigranlib CACHE FILEPATH "")
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
++set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+diff --git a/cmake/toolchains/zig/zigcc b/cmake/toolchains/zig/zigcc
+index 355f992..0aaa584 100755
+--- a/cmake/toolchains/zig/zigcc
++++ b/cmake/toolchains/zig/zigcc
+@@ -1,5 +1,5 @@
+ #!/bin/sh
+-# `zig cc` for cross builds (macOS from Linux). Target from ZIG_TARGET, e.g. aarch64-macos.11.0.
++# `zig cc` for cross builds (macOS, Linux ARM64, Windows ARM64). Target from ZIG_TARGET or the wrapper name.
+ # Drops Apple-toolchain flags zig does not understand; the target already implies them.
+ ZIG=${ZIG:-$(command -v zig || python3 -c "import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),'zig'))")}
+ args=""
+@@ -17,6 +17,8 @@ if [ -z "$ZIG_TARGET" ]; then
+   case "$(basename "$0")" in
+     *-aarch64-macos) ZIG_TARGET=aarch64-macos.11.0 ;;
+     *-x86_64-macos)  ZIG_TARGET=x86_64-macos.11.0 ;;
++    *-aarch64-linux)   ZIG_TARGET=aarch64-linux-gnu.2.28 ;;
++    *-aarch64-windows) ZIG_TARGET=aarch64-windows-gnu ;;
+     *) echo "$0: set ZIG_TARGET" >&2; exit 1 ;;
+   esac
+ fi
+diff --git a/cmake/toolchains/zig/zigcc-aarch64-linux b/cmake/toolchains/zig/zigcc-aarch64-linux
+new file mode 120000
+index 0000000..b2fc811
+--- /dev/null
++++ b/cmake/toolchains/zig/zigcc-aarch64-linux
+@@ -0,0 +1 @@
++zigcc
+\ No newline at end of file
+diff --git a/cmake/toolchains/zig/zigcc-aarch64-windows b/cmake/toolchains/zig/zigcc-aarch64-windows
+new file mode 120000
+index 0000000..b2fc811
+--- /dev/null
++++ b/cmake/toolchains/zig/zigcc-aarch64-windows
+@@ -0,0 +1 @@
++zigcc
+\ No newline at end of file
+diff --git a/cmake/toolchains/zig/zigcxx b/cmake/toolchains/zig/zigcxx
+index 35434bd..7f57a55 100755
+--- a/cmake/toolchains/zig/zigcxx
++++ b/cmake/toolchains/zig/zigcxx
+@@ -1,5 +1,5 @@
+ #!/bin/sh
+-# `zig c++` for cross builds (macOS from Linux). Target from ZIG_TARGET, e.g. aarch64-macos.11.0.
++# `zig c++` for cross builds (macOS, Linux ARM64, Windows ARM64). Target from ZIG_TARGET or the wrapper name.
+ # Drops Apple-toolchain flags zig does not understand; the target already implies them.
+ ZIG=${ZIG:-$(command -v zig || python3 -c "import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),'zig'))")}
+ args=""
+@@ -17,6 +17,8 @@ if [ -z "$ZIG_TARGET" ]; then
+   case "$(basename "$0")" in
+     *-aarch64-macos) ZIG_TARGET=aarch64-macos.11.0 ;;
+     *-x86_64-macos)  ZIG_TARGET=x86_64-macos.11.0 ;;
++    *-aarch64-linux)   ZIG_TARGET=aarch64-linux-gnu.2.28 ;;
++    *-aarch64-windows) ZIG_TARGET=aarch64-windows-gnu ;;
+     *) echo "$0: set ZIG_TARGET" >&2; exit 1 ;;
+   esac
+ fi
+diff --git a/cmake/toolchains/zig/zigcxx-aarch64-linux b/cmake/toolchains/zig/zigcxx-aarch64-linux
+new file mode 120000
+index 0000000..caf08a7
+--- /dev/null
++++ b/cmake/toolchains/zig/zigcxx-aarch64-linux
+@@ -0,0 +1 @@
++zigcxx
+\ No newline at end of file
+diff --git a/cmake/toolchains/zig/zigcxx-aarch64-windows b/cmake/toolchains/zig/zigcxx-aarch64-windows
+new file mode 120000
+index 0000000..caf08a7
+--- /dev/null
++++ b/cmake/toolchains/zig/zigcxx-aarch64-windows
+@@ -0,0 +1 @@
++zigcxx
+\ No newline at end of file
+diff --git a/scripts/capi/build-arm64.sh b/scripts/capi/build-arm64.sh
+new file mode 100755
+index 0000000..8abb217
+--- /dev/null
++++ b/scripts/capi/build-arm64.sh
+@@ -0,0 +1,65 @@
++#!/usr/bin/env bash
++# Cross-build the ARM64 libraries from Linux with Zig (pip install ziglang; no other toolchain):
++#   build-linux-arm64/bin/liblaya.so   Linux aarch64, glibc >= 2.27, ARMv8.0 + NEON baseline
++#   build-win-arm64/bin/laya.dll       native Windows ARM64 (for ARM64 processes; an x64 process
++#                                      running under emulation needs the x64 compat DLL instead)
++# CPU backend. libc++ and ICU are linked in.
++#
++#   scripts/capi/build-arm64.sh [linux] [windows]
++#   RUN_TESTS=1 LAYA_TEST_MODEL=/path/to/checkpoint scripts/capi/build-arm64.sh linux
++#     (runs test-capi through qemu-aarch64-static; needs qemu-user-static libc6-arm64-cross; slow)
++#
++# Needs: cmake ninja-build nlohmann-json3-dev curl, a host C++ compiler (for ICU's data tools).
++set -euo pipefail
++ROOT=$(cd "$(dirname "$0")/../.." && pwd)
++WORK=${WORK:-$ROOT/build-deps}
++JOBS=${JOBS:-$(nproc)}
++VERSION=${LAYA_C_VERSION:-1.0.9}
++ICU_VERSION=${ICU_VERSION:-76-1}
++ICU_TGZ=icu4c-${ICU_VERSION/-/_}-src.tgz
++W=$ROOT/cmake/toolchains/zig
++TARGETS=${*:-linux windows}
++mkdir -p "$WORK" && cd "$WORK"
++
++[ -f "$ICU_TGZ" ] || [ -d icu ] || curl -fsSL -o "$ICU_TGZ" "https://github.com/unicode-org/icu/releases/download/release-$ICU_VERSION/$ICU_TGZ"
++[ -d icu ] || tar xzf "$ICU_TGZ"
++if [ ! -d icu-host/lib ]; then  # native ICU build: cross builds reuse its data tools
++  mkdir -p icu-host && (cd icu-host && ../icu/source/runConfigureICU Linux --disable-tests --disable-samples --disable-extras >/dev/null && make -j"$JOBS" >/dev/null)
++fi
++if [ ! -d nl/include/nlohmann ]; then
++  mkdir -p nl/share/cmake nl/include
++  cp -r /usr/share/cmake/nlohmann_json nl/share/cmake/ && cp -r /usr/include/nlohmann nl/include/
++fi
++
++for target in $TARGETS; do
++  case $target in
++    linux)   zt=aarch64-linux;   host=aarch64-linux-gnu;   prefix=$WORK/icu-linux-arm64; flags="-O2 -fPIC"
++             B=$ROOT/build-linux-arm64; toolchain=zig-linux-aarch64.cmake; tools="laya-trace"
++             uc=libicuuc.a; in=libicui18n.a; dt=libicudata.a ;;
++    windows) zt=aarch64-windows; host=aarch64-w64-mingw32; prefix=$WORK/icu-win-arm64;   flags="-O2"
++             B=$ROOT/build-win-arm64;   toolchain=zig-windows-aarch64.cmake; tools=""
++             uc=libsicuuc.a; in=libsicuin.a; dt=libsicudt.a ;;
++    *) echo "unknown target $target" >&2; exit 1 ;;
++  esac
++  if [ ! -f "$prefix/lib/$uc" ]; then
++    rm -rf "$prefix-build" && mkdir "$prefix-build"
++    (cd "$prefix-build" && CC=$W/zigcc-$zt CXX=$W/zigcxx-$zt AR=$W/zigar RANLIB=$W/zigranlib CFLAGS="$flags" CXXFLAGS="$flags -std=c++17" \
++       ../icu/source/configure --host=$host --with-cross-build="$WORK/icu-host" --enable-static --disable-shared \
++         --with-data-packaging=static --disable-tests --disable-samples --disable-extras --disable-tools --disable-dyload \
++         --prefix="$prefix" >/dev/null && make -j"$JOBS" >/dev/null && (make install >/dev/null 2>&1 || true))
++    # ICU installs only a stub data archive for MinGW targets; the real one stays in the build tree.
++    if [ $target = windows ]; then cp "$prefix-build/lib/sicudt.a" "$prefix/lib/$dt"
++    elif [ ! -f "$prefix/lib/$dt" ]; then cp "$prefix-build/lib/$dt" "$prefix/lib/"; fi
++  fi
++  cmake -S "$ROOT" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/toolchains/$toolchain" \
++    -DLAYA_CUDA=OFF -DLAYA_C_API=ON -DBUILD_SHARED_LIBS=OFF -DLAYA_C_VERSION="$VERSION" \
++    -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF \
++    -DICU_ROOT="$prefix" -DICU_INCLUDE_DIR="$prefix/include" -DICU_UC_LIBRARY_RELEASE="$prefix/lib/$uc" \
++    -DICU_I18N_LIBRARY_RELEASE="$prefix/lib/$in" -DICU_DATA_LIBRARY_RELEASE="$prefix/lib/$dt" \
++    -DCMAKE_CXX_FLAGS=-DU_STATIC_IMPLEMENTATION -Dnlohmann_json_DIR="$WORK/nl/share/cmake/nlohmann_json"
++  cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi laya-cli laya-bench laya-diag $tools
++  echo "== $target arm64: $B/bin"
++  if [ $target = linux ] && [ "${RUN_TESTS:-0}" = 1 ]; then
++    (cd "$B/bin" && LAYA_TEST_QUICK=1 qemu-aarch64-static -L /usr/aarch64-linux-gnu -E LD_LIBRARY_PATH=. ./test-capi) || [ $? = 77 ]
++  fi
++done
+diff --git a/scripts/capi/run-tests.bat b/scripts/capi/run-tests.bat
+index 8f05054..b4155c6 100644
+--- a/scripts/capi/run-tests.bat
++++ b/scripts/capi/run-tests.bat
+@@ -42,6 +42,8 @@ if not "%RC1%"=="0" set FAILED=1
+ >> "%LOG%" echo exit code %RC1%
+ >> "%LOG%" echo.
+ 
++set RC2=skipped
++if not exist LayaTests.exe goto :bench
+ echo [2/3] Pascal binding ...
+ >> "%LOG%" echo ===== 2. LayaTests.exe =====
+ LayaTests.exe "%MODEL%" %BACKEND% >> "%LOG%" 2>&1
+@@ -50,6 +52,8 @@ if not "%RC2%"=="0" set FAILED=1
+ >> "%LOG%" echo exit code %RC2%
+ >> "%LOG%" echo.
+ 
++:bench
++
+ echo [3/3] Speed ...
+ >> "%LOG%" echo ===== 3. laya-bench.exe =====
+ if /i "%BACKEND%"=="cpu" (
+diff --git a/tests/capi/test_capi.c b/tests/capi/test_capi.c
+index 5f8b4a1..541f99d 100644
+--- a/tests/capi/test_capi.c
++++ b/tests/capi/test_capi.c
+@@ -8,6 +8,7 @@
+  *   LAYA_TEST_DUMP=file            also write the reference predictions there (for cross-platform
+  *                                  and laya-cli parity checks, see test_parity.py)
+  *   LAYA_TEST_BACKEND=cpu|cuda|vulkan (default cpu)
++ *   LAYA_TEST_QUICK=1              fewer repetitions in the thread test (slow emulators)
+  * Exit code: 0 pass, 1 failure, 77 model tests skipped (contract tests still passed).
+  */
+ #ifndef _WIN32
+@@ -342,7 +343,7 @@ static void test_model(const char* model, const char* backend, const char* dump_
+         worker_arg args[N];
+         thread_t threads[N];
+         for (int i = 0; i < N; ++i) {
+-            args[i] = (worker_arg){agent, reference, 3, 0};
++            args[i] = (worker_arg){agent, reference, getenv("LAYA_TEST_QUICK") ? 1 : 3, 0};  /* quick: for emulators */
+             CHECK(thread_start(&threads[i], worker, &args[i]) == 0, "thread start");
+         }
+         int mismatches = 0;
+-- 
+2.43.0
+

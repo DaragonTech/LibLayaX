@@ -1,0 +1,89 @@
+From f6c5f557fe5b712e6a5e5b57b70c28f2f4b40314 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 2 Oct 2026 00:41:30 +0100
+Subject: [PATCH 24/30] Windows ARM64: mask FPCR trap enables directly (MinGW
+ feholdexcept leaves them set)
+
+A host that unmasks FP exceptions (FPCR 0x700) made the first overflow in ggml's
+start-up table stall forever on Apple Silicon under Parallels. Clear IOE..IDE for
+the duration of each call and on threads started meanwhile; restore on exit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt         |  2 +-
+ capi/laya_c.cpp             | 24 ++++++++++++++++++++++++
+ scripts/capi/build-arm64.sh |  2 +-
+ 3 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index 74cf0fa..a334935 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ # Flat C ABI shared library over laya.cpp: laya.dll (Windows), liblaya.so (Linux), liblaya.dylib (macOS).
+ # Enable from the top level with -DLAYA_C_API=ON. Build ggml statically (-DBUILD_SHARED_LIBS=OFF)
+ # to get a single self-contained library.
+-set(LAYA_C_VERSION "1.0.12" CACHE STRING "Version string reported by laya_version()")
++set(LAYA_C_VERSION "1.0.13" CACHE STRING "Version string reported by laya_version()")
+ 
+ add_library(laya_c SHARED laya_c.cpp)
+ target_include_directories(laya_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index 0ecad21..63b784b 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -90,6 +90,11 @@ inline void mask_fp_exceptions_on_this_thread() {
+     __asm__ volatile("ldmxcsr %0" : : "m"(csr));
+ #elif defined(_M_X64)
+     _mm_setcsr((_mm_getcsr() | 0x1F80u) & ~0x3Fu);
++#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
++    unsigned long long fpcr;
++    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
++    fpcr &= ~0x9F00ull;  // IOE, DZE, OFE, UFE, IXE, IDE: trap enables off
++    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+ #endif
+ }
+ #endif
+@@ -120,6 +125,25 @@ struct fp_guard {
+     unsigned int csr;
+     fp_guard() : csr(_mm_getcsr()) { _mm_setcsr((csr | 0x1F80u) & ~0x3Fu); }
+     ~fp_guard() { _mm_setcsr(csr); }
++#elif defined(_WIN32) && defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
++    // Windows on ARM64: MinGW's feholdexcept saves the environment and clears the flags but
++    // leaves the trap-enable bits of FPCR as the host set them. On CPUs that implement trapping
++    // (Apple Silicon under Parallels does) the first overflow inside the engine then stalls the
++    // thread forever instead of raising anything. Clear the enables directly for the call.
++    unsigned long long fpcr, fpsr;
++    fp_guard() {
++        __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
++        __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
++        const unsigned long long masked_fpcr = fpcr & ~0x9F00ull;  // IOE DZE OFE UFE IXE IDE off
++        const unsigned long long clear_fpsr = fpsr & ~0x9Full;     // cumulative flags cleared
++        __asm__ volatile("msr fpcr, %0" : : "r"(masked_fpcr));
++        __asm__ volatile("msr fpsr, %0" : : "r"(clear_fpsr));
++    }
++    ~fp_guard() {
++        // Flags first (dropping those raised while masked), then the caller's trap enables.
++        __asm__ volatile("msr fpsr, %0" : : "r"(fpsr));
++        __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
++    }
+ #else
+     std::fenv_t saved;
+     fp_guard() { std::feholdexcept(&saved); }
+diff --git a/scripts/capi/build-arm64.sh b/scripts/capi/build-arm64.sh
+index ce7ce08..ea9a43e 100755
+--- a/scripts/capi/build-arm64.sh
++++ b/scripts/capi/build-arm64.sh
+@@ -19,7 +19,7 @@ set -euo pipefail
+ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ WORK=${WORK:-$ROOT/build-deps}
+ JOBS=${JOBS:-$(nproc)}
+-VERSION=${LAYA_C_VERSION:-1.0.12}
++VERSION=${LAYA_C_VERSION:-1.0.13}
+ ICU_VERSION=${ICU_VERSION:-76-1}
+ ICU_TGZ=icu4c-${ICU_VERSION/-/_}-src.tgz
+ W=$ROOT/cmake/toolchains/zig
+-- 
+2.43.0
+

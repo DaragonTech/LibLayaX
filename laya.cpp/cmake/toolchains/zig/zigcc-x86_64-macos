@@ -1,0 +1,25 @@
+#!/bin/sh
+# `zig cc` for cross builds (macOS, Linux ARM64, Windows ARM64). Target from ZIG_TARGET or the wrapper name.
+# Drops Apple-toolchain flags zig does not understand; the target already implies them.
+ZIG=${ZIG:-$(command -v zig || python3 -c "import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),'zig'))")}
+args=""
+skip=""
+for a in "$@"; do
+  if [ -n "$skip" ]; then skip=""; continue; fi
+  case "$a" in
+    -arch|-isysroot) skip=1 ;;
+    -mmacosx-version-min=*|--target=*|-target=*) ;;
+    *) args="$args '$(printf %s "$a" | sed "s/'/'\\\\''/g")'" ;;
+  esac
+done
+# Target: ZIG_TARGET, else from the wrapper name (zigcc-aarch64-macos -> aarch64-macos.11.0).
+if [ -z "$ZIG_TARGET" ]; then
+  case "$(basename "$0")" in
+    *-aarch64-macos) ZIG_TARGET=aarch64-macos.11.0 ;;
+    *-x86_64-macos)  ZIG_TARGET=x86_64-macos.11.0 ;;
+    *-aarch64-linux)   ZIG_TARGET=aarch64-linux-gnu.2.28 ;;
+    *-aarch64-windows) ZIG_TARGET=aarch64-windows-gnu ;;
+    *) echo "$0: set ZIG_TARGET" >&2; exit 1 ;;
+  esac
+fi
+eval exec "$ZIG" cc -target "$ZIG_TARGET" $args

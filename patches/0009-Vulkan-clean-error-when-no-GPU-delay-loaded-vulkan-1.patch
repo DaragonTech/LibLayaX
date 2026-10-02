@@ -1,0 +1,260 @@
+From f104ab6f56f9793ea27c253d6e0485a574649d64 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 20:22:03 +0100
+Subject: [PATCH 09/30] Vulkan: clean error when no GPU; delay-loaded
+ vulkan-1.dll; Vulkan build variants; laya-bench
+
+- runtime: report a missing Vulkan device as an error instead of ggml's abort
+- capi (Windows): check vulkan-1.dll before Vulkan use; link it delay-loaded so laya.dll
+  loads and the CPU backend works on PCs without Vulkan
+- build-linux.sh: vulkan variant, EXTRA_CMAKE_ARGS (newer glslc/headers)
+- tests/capi/bench_capi.c: per-configuration load time, latency, throughput, answer check
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt         |   8 +++
+ capi/laya_c.cpp             |  11 ++-
+ scripts/capi/build-linux.sh |   8 ++-
+ src/runtime.cpp             |   8 ++-
+ tests/capi/bench_capi.c     | 129 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 161 insertions(+), 3 deletions(-)
+ create mode 100644 tests/capi/bench_capi.c
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index a071328..39c18f4 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -51,6 +51,14 @@ if(BUILD_TESTING)
+     find_package(Threads REQUIRED)
+     target_link_libraries(test-capi PRIVATE Threads::Threads m)
+   endif()
++  add_executable(laya-bench ${CMAKE_SOURCE_DIR}/tests/capi/bench_capi.c)
++  set_target_properties(laya-bench PROPERTIES C_STANDARD 11 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
++  target_link_libraries(laya-bench PRIVATE laya_c)
++  if(MINGW)
++    target_link_options(laya-bench PRIVATE -static)
++  elseif(APPLE)
++    set_target_properties(laya-bench PROPERTIES BUILD_RPATH "@executable_path")
++  endif()
+   # The model-dependent tests are skipped (exit 77) unless LAYA_TEST_MODEL names a checkpoint.
+   add_test(NAME capi COMMAND test-capi)
+   set_tests_properties(capi PROPERTIES SKIP_RETURN_CODE 77)
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index 5c163d1..833c2af 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -339,7 +339,16 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+         laya::backend_type backend;
+         if (backend_text == "cpu") backend = laya::backend_type::cpu;
+         else if (backend_text == "cuda") backend = laya::backend_type::cuda;
+-        else if (backend_text == "vulkan") backend = laya::backend_type::vulkan;
++        else if (backend_text == "vulkan") {
++            backend = laya::backend_type::vulkan;
++#if defined(_WIN32) && defined(LAYA_VULKAN)
++            // laya.dll delay-loads vulkan-1.dll (installed with GPU drivers), so the library and the
++            // CPU backend work on machines without it; check before anything touches Vulkan.
++            if (!LoadLibraryW(L"vulkan-1.dll"))
++                throw std::runtime_error("Vulkan is not installed on this computer (vulkan-1.dll not found); "
++                                         "install or update the GPU driver, or use the cpu backend");
++#endif
++        }
+         else throw std::invalid_argument("Unknown backend: " + backend_text);
+ 
+         const std::string precision_text = options.value("precision", "fp32");
+diff --git a/scripts/capi/build-linux.sh b/scripts/capi/build-linux.sh
+index b61fc8c..c7f0631 100755
+--- a/scripts/capi/build-linux.sh
++++ b/scripts/capi/build-linux.sh
+@@ -2,12 +2,15 @@
+ # Build portable liblaya.so variants (Linux x86-64, CPU backend):
+ #   build-linux-avx2/bin/liblaya.so    AVX2/FMA/F16C/BMI2 baseline (fast, ~2013+ CPUs)
+ #   build-linux-compat/bin/liblaya.so  SSE4.2 baseline (any x86-64 since ~2009, and emulators)
++#   build-linux-vulkan/bin/liblaya.so  GPU via Vulkan (VARIANTS=vulkan; also links libvulkan.so.1)
+ # ICU, libstdc++ and libgcc are linked in statically, so the library needs only glibc
+ # (libc, libm, libpthread) from the system and works across distributions of the same or newer
+ # glibc than the build machine.
+ #
+ #   scripts/capi/build-linux.sh            # build both
+ #   VARIANTS=compat scripts/capi/build-linux.sh
++#   VARIANTS=vulkan EXTRA_CMAKE_ARGS="-DVulkan_GLSLC_EXECUTABLE=/path/to/glslc -DVulkan_INCLUDE_DIR=..." ...
++#     (Ubuntu 24.04's glslc 2023.8 crashes on laya's shaders; use shaderc >= 2025.3 / Vulkan SDK 1.4)
+ #
+ # Needs: cmake ninja-build g++ nlohmann-json3-dev curl
+ set -euo pipefail
+@@ -40,6 +43,9 @@ for variant in $VARIANTS; do
+   case $variant in
+     avx2)   isa=(-DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON) ;;
+     compat) isa=(-DGGML_SSE42=ON -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF) ;;
++    # GPU through Vulkan (needs libvulkan-dev glslc spirv-headers to build, a Vulkan driver to run);
++    # its CPU fallback backend uses the avx2 baseline.
++    vulkan) isa=(-DLAYA_VULKAN=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON) ;;
+     *) echo "unknown variant $variant" >&2; exit 1 ;;
+   esac
+   cmake -S "$ROOT" -B "$ROOT/build-linux-$variant" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+@@ -49,7 +55,7 @@ for variant in $VARIANTS; do
+     -DICU_I18N_LIBRARY_RELEASE="$I/lib/libicui18n.a" -DICU_DATA_LIBRARY_RELEASE="$I/lib/libicudata.a" \
+     -DCMAKE_CXX_FLAGS="-DU_STATIC_IMPLEMENTATION" \
+     -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
+-    -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
++    -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" ${EXTRA_CMAKE_ARGS:-}
+   cmake --build "$ROOT/build-linux-$variant" --parallel "$JOBS" --target laya_c test-capi laya-cli
+   strip --strip-unneeded "$ROOT/build-linux-$variant/bin/liblaya.so"
+   echo "== $variant: $ROOT/build-linux-$variant/bin/liblaya.so"
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index 7a56f5b..300d281 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -140,7 +140,13 @@ struct runtime::impl {
+         if (cuda) throw std::runtime_error("This build has no CUDA backend");
+ #endif
+ #ifdef LAYA_VULKAN
+-        if (vulkan) backend = ggml_backend_vk_init(0);
++        if (vulkan) {
++            // ggml asserts (aborting the whole process) when asked for a device that does not
++            // exist, so report a missing GPU as an ordinary error instead.
++            if (ggml_backend_vk_get_device_count() < 1)
++                throw std::runtime_error("No usable Vulkan GPU found (GGML_VK_VISIBLE_DEVICES can select one)");
++            backend = ggml_backend_vk_init(0);
++        }
+ #else
+         if (vulkan) throw std::runtime_error("This build has no Vulkan backend");
+ #endif
+diff --git a/tests/capi/bench_capi.c b/tests/capi/bench_capi.c
+new file mode 100644
+index 0000000..55e2bbe
+--- /dev/null
++++ b/tests/capi/bench_capi.c
+@@ -0,0 +1,129 @@
++/* bench_capi.c - compare backends/precisions of the laya C API on one machine.
++ *
++ *   laya-bench MODEL_DIR [OPTIONS_JSON ...]
++ *   laya-bench C:\models\laya {"backend":"cpu"} {"backend":"vulkan"} {"backend":"vulkan","precision":"fp16"}
++ *
++ * Without options it runs cpu, vulkan (fp32), vulkan + tensor_core, vulkan fp16 and vulkan bf16.
++ * For each configuration: load time, ms per single question, ms per question in a batch of 8,
++ * and whether the answers match the first configuration (to 2 decimals: GPU and CPU round
++ * differently in the last digits).
++ */
++#include "laya_c.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#ifdef _WIN32
++#include <windows.h>
++static double now_ms(void) {
++    LARGE_INTEGER f, c;
++    QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c);
++    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
++}
++#else
++static double now_ms(void) {
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
++}
++#endif
++
++static const char* SINGLE =
++    "{\"state\":\"Please refund the duplicate charge.\",\"questions\":{\"refund\":{\"type\":\"noul\","
++    "\"instructions\":\"Does the customer ask for a refund?\"}}}";
++static const char* ONE_OF_BATCH =
++    "{\"state\":\"I want to cancel my subscription, this is the third time I am writing.\",\"questions\":{"
++    "\"intent\":{\"type\":\"choice\",\"instructions\":\"What does the customer want?\",\"criteria\":[\"cancel\",\"upgrade\",\"refund\"]},"
++    "\"anger\":{\"type\":\"score\",\"instructions\":\"How angry is the customer?\",\"criteria\":[\"calm\",\"annoyed\",\"furious\"]}}}";
++
++/* First number after `key` in `json`, or -1. */
++static double number_after(const char* json, const char* key) {
++    const char* p = json ? strstr(json, key) : NULL;
++    return p ? atof(p + strlen(key)) : -1.0;
++}
++
++static int run(const char* model, const char* options, double* ref_noul, double* ref_cancel) {
++    printf("\n== %s\n", options);
++    fflush(stdout);
++    double t0 = now_ms();
++    laya_agent* agent = laya_create(model, options);
++    if (!agent) {
++        printf("   load failed: %s\n", laya_last_error());
++        return 0;
++    }
++    char* info = laya_info(agent);
++    printf("   device: %s\n", info);
++    laya_free_string(info);
++    printf("   load: %.0f ms\n", now_ms() - t0);
++
++    /* batch of 8 requests = 16 questions */
++    size_t cap = 8 * strlen(ONE_OF_BATCH) + 16;
++    char* batch = (char*)malloc(cap);
++    strcpy(batch, "[");
++    for (int i = 0; i < 8; ++i) { if (i) strcat(batch, ","); strcat(batch, ONE_OF_BATCH); }
++    strcat(batch, "]");
++
++    char* r = laya_predict(agent, SINGLE);
++    if (!r || strncmp(r, "{\"error\"", 8) == 0) {
++        printf("   predict failed: %s\n", r ? r : "(null)");
++        laya_free_string(r);
++        free(batch);
++        laya_destroy(agent);
++        return 0;
++    }
++    double noul = number_after(r, "\"noul\":");
++    laya_free_string(r);
++    for (int i = 0; i < 2; ++i) laya_free_string(laya_predict(agent, SINGLE));  /* warm-up */
++    r = laya_predict(agent, batch);
++    double cancel = number_after(r, "\"cancel\":");
++    laya_free_string(r);
++
++    const int n1 = 10, nb = 5;
++    t0 = now_ms();
++    for (int i = 0; i < n1; ++i) laya_free_string(laya_predict(agent, SINGLE));
++    double single = (now_ms() - t0) / n1;
++    t0 = now_ms();
++    for (int i = 0; i < nb; ++i) laya_free_string(laya_predict(agent, batch));
++    double per_question = (now_ms() - t0) / nb / 16.0;
++
++    printf("   single question: %7.1f ms\n", single);
++    printf("   batch of 16:     %7.1f ms per question  (%.0f questions/s)\n", per_question, 1000.0 / per_question);
++    printf("   answers: noul=%.4f cancel=%.4f", noul, cancel);
++    int ok = 1;
++    if (*ref_noul < 0) {
++        *ref_noul = noul;
++        *ref_cancel = cancel;
++        printf("  (reference)\n");
++    } else {
++        double d1 = noul - *ref_noul, d2 = cancel - *ref_cancel;
++        ok = d1 < 0.01 && d1 > -0.01 && d2 < 0.01 && d2 > -0.01;
++        printf("  %s\n", ok ? "(matches reference)" : "(DIFFERS from reference)");
++    }
++    free(batch);
++    laya_destroy(agent);
++    return ok;
++}
++
++int main(int argc, char** argv) {
++    if (argc < 2) {
++        fprintf(stderr, "usage: %s MODEL_DIR [OPTIONS_JSON ...]\n", argv[0]);
++        return 2;
++    }
++    static const char* defaults[] = {
++        "{\"backend\":\"cpu\"}",
++        "{\"backend\":\"vulkan\"}",
++        "{\"backend\":\"vulkan\",\"tensor_core\":true}",
++        "{\"backend\":\"vulkan\",\"precision\":\"fp16\"}",
++        "{\"backend\":\"vulkan\",\"precision\":\"bf16\"}",
++    };
++    printf("%s\n", laya_version());
++    double ref_noul = -1, ref_cancel = -1;
++    int differ = 0;
++    if (argc > 2)
++        for (int i = 2; i < argc; ++i) differ += !run(argv[1], argv[i], &ref_noul, &ref_cancel);
++    else
++        for (size_t i = 0; i < sizeof defaults / sizeof defaults[0]; ++i) differ += !run(argv[1], defaults[i], &ref_noul, &ref_cancel);
++    return differ ? 1 : 0;
++}
+-- 
+2.43.0
+

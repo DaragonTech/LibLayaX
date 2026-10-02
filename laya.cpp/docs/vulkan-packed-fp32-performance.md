@@ -1,0 +1,69 @@
+# Vulkan FP32 performance after QKV packing
+
+These paired measurements use the validated QKV-packing build, preserved with
+its shared libraries. Python runs on the same GPU as Vulkan: CUDA on the RTX PRO
+6000 Blackwell capped at **450 W**, and ROCm on the Radeon 8060S. Plain FP32 and
+compensated projections each use matching Python FP32 as their baseline.
+
+Each row covers all 250 fixed questions, three warmups and five timed iterations
+per group. Execution order alternates. Tokenization, inference and formatting
+are timed; model loading and native JSON transport are excluded. Background
+services retain allocations; no other GPU experiments or builds run concurrently.
+Every recorded answer comparison passes exact categories and absolute numeric
+tolerance 0.0001.
+
+Rates are questions/second.
+
+| GPU | Model | Mode | Batch | Python FP32 | Vulkan | Vulkan/Python |
+|---|---|---|---:|---:|---:|---:|
+| NVIDIA | english | plain | 1 | 141.2 | 62.3 | 0.44× |
+| NVIDIA | english | plain | 2 | 205.2 | 104.7 | 0.51× |
+| NVIDIA | english | plain | 4 | 244.9 | 137.3 | 0.56× |
+| NVIDIA | english | plain | 8 | 236.0 | 166.5 | 0.71× |
+| NVIDIA | english | compensated | 1 | 147.0 | 117.6 | 0.80× |
+| NVIDIA | english | compensated | 2 | 204.9 | 178.1 | 0.87× |
+| NVIDIA | english | compensated | 4 | 247.3 | 240.2 | 0.97× |
+| NVIDIA | english | compensated | 8 | 246.6 | 280.1 | 1.14× |
+| NVIDIA | multilingual | plain | 1 | 183.4 | 109.6 | 0.60× |
+| NVIDIA | multilingual | plain | 2 | 294.0 | 164.5 | 0.56× |
+| NVIDIA | multilingual | plain | 4 | 395.4 | 254.7 | 0.64× |
+| NVIDIA | multilingual | plain | 8 | 419.5 | 284.1 | 0.68× |
+| NVIDIA | multilingual | compensated | 1 | 188.9 | 114.3 | 0.60× |
+| NVIDIA | multilingual | compensated | 2 | 304.4 | 204.3 | 0.67× |
+| NVIDIA | multilingual | compensated | 4 | 405.3 | 305.9 | 0.75× |
+| NVIDIA | multilingual | compensated | 8 | 432.1 | 358.2 | 0.83× |
+| NVIDIA | typed-decisions | plain | 1 | 126.8 | 57.2 | 0.45× |
+| NVIDIA | typed-decisions | plain | 2 | 169.6 | 95.5 | 0.56× |
+| NVIDIA | typed-decisions | plain | 4 | 183.5 | 113.3 | 0.62× |
+| NVIDIA | typed-decisions | plain | 8 | 166.9 | 122.1 | 0.73× |
+| NVIDIA | typed-decisions | compensated | 1 | 133.8 | 98.1 | 0.73× |
+| NVIDIA | typed-decisions | compensated | 2 | 177.5 | 144.0 | 0.81× |
+| NVIDIA | typed-decisions | compensated | 4 | 191.7 | 172.8 | 0.90× |
+| NVIDIA | typed-decisions | compensated | 8 | 169.9 | 187.8 | 1.11× |
+| AMD | english | plain | 1 | 16.8 | 10.2 | 0.61× |
+| AMD | english | plain | 2 | 18.1 | 16.5 | 0.91× |
+| AMD | english | plain | 4 | 17.7 | 20.1 | 1.14× |
+| AMD | english | plain | 8 | 15.7 | 20.2 | 1.29× |
+| AMD | english | compensated | 1 | 16.1 | 20.2 | 1.26× |
+| AMD | english | compensated | 2 | 17.2 | 26.3 | 1.53× |
+| AMD | english | compensated | 4 | 16.9 | 27.6 | 1.63× |
+| AMD | english | compensated | 8 | 15.1 | 27.9 | 1.85× |
+| AMD | multilingual | plain | 1 | 35.5 | 33.6 | 0.95× |
+| AMD | multilingual | plain | 2 | 37.6 | 51.2 | 1.36× |
+| AMD | multilingual | plain | 4 | 36.2 | 59.0 | 1.63× |
+| AMD | multilingual | plain | 8 | 31.3 | 57.2 | 1.82× |
+| AMD | multilingual | compensated | 1 | 35.7 | 64.3 | 1.80× |
+| AMD | multilingual | compensated | 2 | 38.2 | 80.6 | 2.11× |
+| AMD | multilingual | compensated | 4 | 36.8 | 84.6 | 2.30× |
+| AMD | multilingual | compensated | 8 | 31.4 | 76.9 | 2.45× |
+| AMD | typed-decisions | plain | 1 | 13.5 | 9.3 | 0.69× |
+| AMD | typed-decisions | plain | 2 | 14.9 | 14.6 | 0.98× |
+| AMD | typed-decisions | plain | 4 | 13.8 | 17.0 | 1.23× |
+| AMD | typed-decisions | plain | 8 | 12.0 | 16.1 | 1.35× |
+| AMD | typed-decisions | compensated | 1 | 13.5 | 17.4 | 1.28× |
+| AMD | typed-decisions | compensated | 2 | 14.7 | 22.7 | 1.55× |
+| AMD | typed-decisions | compensated | 4 | 13.7 | 23.0 | 1.68× |
+| AMD | typed-decisions | compensated | 8 | 11.8 | 22.0 | 1.86× |
+
+See [measurement metadata](measurements/vulkan-packed-fp32-performance.json) for
+binary, weight, corpus and report identities.

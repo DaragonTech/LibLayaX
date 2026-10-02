@@ -1,0 +1,70 @@
+From 52fb6e550bb0c559c6f17d47890f18713732ae40 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 2 Oct 2026 01:45:26 +0100
+Subject: [PATCH 28/30] capi 1.0.14 on all platforms: laya-probe in every build
+ script; Linux exports exactly the ten API functions
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/linux-exports.map              | 5 +++--
+ scripts/capi/build-linux.sh         | 2 +-
+ scripts/capi/build-macos.sh         | 2 +-
+ scripts/capi/build-windows-mingw.sh | 2 +-
+ 4 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/capi/linux-exports.map b/capi/linux-exports.map
+index 4c870ca..d3fec21 100644
+--- a/capi/linux-exports.map
++++ b/capi/linux-exports.map
+@@ -1,5 +1,6 @@
+-/* Only the C API is exported from liblaya.so. */
+ {
+-  global: laya_*;
++  global:
++    laya_version; laya_api_version; laya_set_log_callback; laya_create; laya_predict;
++    laya_prepare; laya_info; laya_free_string; laya_destroy; laya_last_error;
+   local: *;
+ };
+diff --git a/scripts/capi/build-linux.sh b/scripts/capi/build-linux.sh
+index dd434fd..49a7ade 100755
+--- a/scripts/capi/build-linux.sh
++++ b/scripts/capi/build-linux.sh
+@@ -63,7 +63,7 @@ for variant in $VARIANTS; do
+     -DCMAKE_CXX_FLAGS="-DU_STATIC_IMPLEMENTATION" \
+     -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
+     -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" ${EXTRA_CMAKE_ARGS:-}
+-  cmake --build "$ROOT/build-linux-$variant" --parallel "$JOBS" --target laya_c test-capi laya-cli laya-bench laya-diag laya-trace
++  cmake --build "$ROOT/build-linux-$variant" --parallel "$JOBS" --target laya_c test-capi laya-cli laya-bench laya-diag laya-trace laya-probe
+   strip --strip-unneeded "$ROOT/build-linux-$variant/bin/liblaya.so"
+   echo "== $variant: $ROOT/build-linux-$variant/bin/liblaya.so"
+   readelf -d "$ROOT/build-linux-$variant/bin/liblaya.so" | grep NEEDED
+diff --git a/scripts/capi/build-macos.sh b/scripts/capi/build-macos.sh
+index 50d138e..061063b 100755
+--- a/scripts/capi/build-macos.sh
++++ b/scripts/capi/build-macos.sh
+@@ -77,7 +77,7 @@ for variant in $VARIANTS; do
+     -DICU_ROOT="$I" -DICU_INCLUDE_DIR="$I/include" -DICU_UC_LIBRARY_RELEASE="$I/lib/libicuuc.a" \
+     -DICU_I18N_LIBRARY_RELEASE="$I/lib/libicui18n.a" -DICU_DATA_LIBRARY_RELEASE="$I/lib/libicudata.a" \
+     -Dnlohmann_json_DIR="$WORK/nl/share/cmake/nlohmann_json"
+-  cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi laya-bench laya-diag laya-trace
++  cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi laya-bench laya-diag laya-trace laya-probe
+ 
+   # zig's Mach-O linker ignores -exported_symbols_list, so relink the dylib with LLVM's ld64.lld
+   # against the same libc++/compiler-rt that zig uses (found by letting zig link a probe).
+diff --git a/scripts/capi/build-windows-mingw.sh b/scripts/capi/build-windows-mingw.sh
+index 7250d0d..f985b72 100755
+--- a/scripts/capi/build-windows-mingw.sh
++++ b/scripts/capi/build-windows-mingw.sh
+@@ -67,7 +67,7 @@ for variant in ${VARIANTS:-avx2 compat}; do
+     -DICU_ROOT="$I" -DICU_INCLUDE_DIR="$I/include" -DICU_UC_LIBRARY_RELEASE="$I/lib/libsicuuc.a" \
+     -DICU_I18N_LIBRARY_RELEASE="$I/lib/libsicuin.a" -DICU_DATA_LIBRARY_RELEASE="$I/lib/libsicudt.a" \
+     "-DCMAKE_CXX_FLAGS=$cxxflags" -Dnlohmann_json_DIR="$WORK/nl/share/cmake/nlohmann_json"
+-  cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi laya-bench laya-diag laya-cli
++  cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi laya-bench laya-diag laya-probe laya-cli
+   x86_64-w64-mingw32-strip --strip-unneeded "$B/bin/laya.dll"
+   echo "== $variant: $B/bin/laya.dll"
+   x86_64-w64-mingw32-objdump -p "$B/bin/laya.dll" | grep "DLL Name"
+-- 
+2.43.0
+

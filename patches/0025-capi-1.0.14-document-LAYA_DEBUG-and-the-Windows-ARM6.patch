@@ -1,0 +1,103 @@
+From 4d1e323dcae0e6822f0f1d5976d5489c82e183c4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 2 Oct 2026 00:52:28 +0100
+Subject: [PATCH 25/30] capi 1.0.14: document LAYA_DEBUG and the Windows ARM64
+ findings; clean build without the ggml trace patch
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt         |  2 +-
+ capi/README.md              | 30 ++++++++++++++++++++++++++++--
+ scripts/capi/build-arm64.sh |  2 +-
+ 3 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index a334935..452a131 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ # Flat C ABI shared library over laya.cpp: laya.dll (Windows), liblaya.so (Linux), liblaya.dylib (macOS).
+ # Enable from the top level with -DLAYA_C_API=ON. Build ggml statically (-DBUILD_SHARED_LIBS=OFF)
+ # to get a single self-contained library.
+-set(LAYA_C_VERSION "1.0.13" CACHE STRING "Version string reported by laya_version()")
++set(LAYA_C_VERSION "1.0.14" CACHE STRING "Version string reported by laya_version()")
+ 
+ add_library(laya_c SHARED laya_c.cpp)
+ target_include_directories(laya_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+diff --git a/capi/README.md b/capi/README.md
+index be3f9c6..61ccf36 100644
+--- a/capi/README.md
++++ b/capi/README.md
+@@ -45,8 +45,8 @@ are rejected, so typos fail loudly.
+   calling from many threads.
+ * **Floating-point state is protected.** Delphi and Free Pascal unmask FP exceptions, which
+   would otherwise make the engine's IEEE arithmetic raise `EInvalidOp`. Every entry point masks
+-  exceptions (x87 and SSE/MXCSR) and restores the caller's exact state on return. You don't
+-  need `SetExceptionMask` in your Delphi code.
++  exceptions (x87 and SSE/MXCSR on x86-64, the FPCR trap enables on ARM64) and restores the
++  caller's exact state on return. You don't need `SetExceptionMask` in your Delphi code.
+ * **Memory.** A loaded model takes about 1.7 GB of RAM (CPU, fp32) or the equivalent in VRAM.
+   Create one agent per model and keep it for the life of the process.
+ * **Paths are UTF-8.** Non-ASCII Windows paths work.
+@@ -54,6 +54,18 @@ are rejected, so typos fail loudly.
+   validated checkpoints) still terminate the process. The message is sent to your log callback
+   first.
+ 
++## Diagnostics (environment variables)
++
++* `LAYA_DEBUG=1`: every entry point prints its progress on stderr as `[laya] ...` lines,
++  flushed one by one: entry, the floating-point registers before and after the guard (ARM64),
++  each stage of a model load down to every tensor, and the reason for a failure. If a call
++  never returns, the last line shows where it is. Works in any host program.
++* `LAYA_CRASH_REPORT=1` (Windows): hardware exceptions are reported on stderr and in
++  `laya-crash.txt` with module offsets and a stack trace before the host handles them.
++* `capi/patches/ggml-trace.diff`: optional patch for `third_party/ggml` that extends the
++  `LAYA_DEBUG` trace into the start-up of the CPU engine (apply with `git apply` in
++  `third_party/ggml`). It located the Windows-on-ARM stall described below.
++
+ ## Building
+ 
+ The library is an opt-in target: `-DLAYA_C_API=ON`. Build ggml statically so you get one
+@@ -84,6 +96,16 @@ cmake --build build-win --target laya_c test-capi
+ **Linux**: `cmake -S . -B build -DLAYA_C_API=ON -DBUILD_SHARED_LIBS=OFF [-DLAYA_CUDA=OFF]`
+ produces `build/bin/liblaya.so`.
+ 
++**Windows on ARM64 (native)**: `LLVM_MINGW=/path/to/llvm-mingw scripts/capi/build-arm64.sh windows`
++cross-builds with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw). Two things were learnt
++on real hardware (Windows 11 on ARM under Parallels, Apple M3 Ultra):
++* A DLL built with Zig 0.16 for `aarch64-windows-gnu` hung in the first call that reports an
++  error (cause not identified; the same code built with llvm-mingw works). Use llvm-mingw.
++* MinGW's `feholdexcept` leaves the FPCR trap-enable bits set. With a host that unmasks FP
++  exceptions the first overflow in the engine then stalled the thread forever, so the library
++  clears and restores those bits itself (`fp_guard` in `capi/laya_c.cpp`). Emulators (QEMU)
++  ignore trap enables and cannot reproduce this.
++
+ ## Tests
+ 
+ * `tests/capi/test_capi.c`: C11 test suite. Runs API-contract tests (bad paths, bad
+@@ -97,4 +119,8 @@ produces `build/bin/liblaya.so`.
+ * `tests/capi/make_synthetic_model.py`: writes a checkpoint with the exact production
+   architecture and a real BPE tokenizer but random weights, for testing without downloading
+   the model. Its answers are meaningless; it only proves the pipeline end to end.
++* `tests/capi/probe.cpp` (`laya-probe`): stand-alone check of the C++ runtime features the
++  library relies on (atomics, thread-local storage, FP environment, the engine's start-up
++  arithmetic, call_once, mutexes, exceptions, threads). No library, no model; each step is
++  announced before it runs.
+ * `delphi/LayaTests.dpr`: the same kind of tests through the Delphi binding.
+diff --git a/scripts/capi/build-arm64.sh b/scripts/capi/build-arm64.sh
+index ea9a43e..681ca6a 100755
+--- a/scripts/capi/build-arm64.sh
++++ b/scripts/capi/build-arm64.sh
+@@ -19,7 +19,7 @@ set -euo pipefail
+ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ WORK=${WORK:-$ROOT/build-deps}
+ JOBS=${JOBS:-$(nproc)}
+-VERSION=${LAYA_C_VERSION:-1.0.13}
++VERSION=${LAYA_C_VERSION:-1.0.14}
+ ICU_VERSION=${ICU_VERSION:-76-1}
+ ICU_TGZ=icu4c-${ICU_VERSION/-/_}-src.tgz
+ W=$ROOT/cmake/toolchains/zig
+-- 
+2.43.0
+

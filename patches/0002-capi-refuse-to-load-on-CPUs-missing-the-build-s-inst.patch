@@ -1,0 +1,234 @@
+From 713ae3775ec334a095bb6ffb6ce68a8406c00720 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 17:42:00 +0100
+Subject: [PATCH 02/30] capi: refuse to load on CPUs missing the build's
+ instruction set; opt-in crash reporter
+
+- laya_create checks CPUID/XCR0 against the ggml baseline the library was
+  compiled for (LAYA_REQUIRE_* from CMake) and returns a clear error instead
+  of crashing on an illegal instruction (Free Pascal/Delphi report that as a
+  bare EAccessViolation).
+- LAYA_CRASH_REPORT=1 installs a vectored exception handler on Windows that
+  writes the faulting module offset and a stack trace to stderr and
+  laya-crash.txt.
+- Synthetic test checkpoint now mirrors the published rl_agent_config.json
+  (one action cost, calibrated temperatures).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt                |   7 ++
+ capi/laya_c.cpp                    | 126 +++++++++++++++++++++++++++++
+ tests/capi/make_synthetic_model.py |  13 ++-
+ 3 files changed, 142 insertions(+), 4 deletions(-)
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index fe5f8b1..cebabb0 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -9,6 +9,13 @@ target_link_libraries(laya_c PRIVATE laya)
+ target_compile_features(laya_c PRIVATE cxx_std_20)
+ target_compile_definitions(laya_c PRIVATE LAYA_C_VERSION="${LAYA_C_VERSION}"
+   $<$<BOOL:${LAYA_CUDA}>:LAYA_CUDA=1> $<$<BOOL:${LAYA_VULKAN}>:LAYA_VULKAN=1>)
++# Tell the library which instruction-set baseline ggml was compiled for, so it can refuse to load
++# with a clear message on an older CPU instead of crashing on an illegal instruction.
++foreach(feature AVX AVX2 FMA F16C BMI2 AVX512F)
++  if(GGML_${feature} AND NOT GGML_NATIVE)
++    target_compile_definitions(laya_c PRIVATE LAYA_REQUIRE_${feature}=1)
++  endif()
++endforeach()
+ target_compile_options(laya_c PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall;-Wextra>)
+ set_target_properties(laya_c PROPERTIES
+   OUTPUT_NAME laya
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index 4a96396..5b3de48 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -16,8 +16,18 @@
+ #include <new>
+ #include <string>
+ #include <thread>
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++#endif
+ #if defined(__x86_64__) || defined(_M_X64)
+ #include <xmmintrin.h>
++#if defined(_MSC_VER)
++#include <intrin.h>
++#else
++#include <cpuid.h>
++#endif
+ #endif
+ 
+ #ifndef LAYA_C_VERSION
+@@ -77,11 +87,124 @@ void forward_abort(const char* message) {  // ggml aborts the process afterwards
+     forward_log(GGML_LOG_LEVEL_ERROR, message, nullptr);
+     forward_log(GGML_LOG_LEVEL_CONT, "\n", nullptr);
+ }
++// The engine is compiled for a fixed instruction-set baseline (see LAYA_REQUIRE_* from CMake).
++// Running it on an older CPU would die on an illegal instruction, which hosts such as Delphi
++// report as a bare "Access violation". Check up front and fail with a clear message instead.
++std::string missing_cpu_features() {
++    std::string missing;
++#if defined(__x86_64__) || defined(_M_X64)
++    unsigned r1[4] = {}, r7[4] = {};
++#if defined(_MSC_VER)
++    int a[4];
++    __cpuid(a, 0); const unsigned max_leaf = unsigned(a[0]);
++    __cpuidex(a, 1, 0); for (int i = 0; i < 4; ++i) r1[i] = unsigned(a[i]);
++    if (max_leaf >= 7) { __cpuidex(a, 7, 0); for (int i = 0; i < 4; ++i) r7[i] = unsigned(a[i]); }
++#else
++    const unsigned max_leaf = __get_cpuid_max(0, nullptr);
++    __cpuid_count(1, 0, r1[0], r1[1], r1[2], r1[3]);
++    if (max_leaf >= 7) __cpuid_count(7, 0, r7[0], r7[1], r7[2], r7[3]);
++#endif
++    const unsigned ecx1 = r1[2], ebx7 = r7[1];
++    bool ymm_os = false, zmm_os = false;  // the OS must save the wider registers too
++    if (ecx1 & (1u << 27)) {              // OSXSAVE
++#if defined(_MSC_VER)
++        const unsigned long long xcr0 = _xgetbv(0);
++#else
++        unsigned lo, hi;
++        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
++        const unsigned long long xcr0 = (static_cast<unsigned long long>(hi) << 32) | lo;
++#endif
++        ymm_os = (xcr0 & 0x6) == 0x6;
++        zmm_os = (xcr0 & 0xE6) == 0xE6;
++    }
++    auto need = [&](bool have, const char* name) { if (!have) missing += missing.empty() ? name : std::string(", ") + name; };
++#ifdef LAYA_REQUIRE_AVX
++    need((ecx1 & (1u << 28)) && ymm_os, "AVX");
++#endif
++#ifdef LAYA_REQUIRE_AVX2
++    need((ebx7 & (1u << 5)) && ymm_os, "AVX2");
++#endif
++#ifdef LAYA_REQUIRE_FMA
++    need((ecx1 & (1u << 12)) && ymm_os, "FMA");
++#endif
++#ifdef LAYA_REQUIRE_F16C
++    need(ecx1 & (1u << 29), "F16C");
++#endif
++#ifdef LAYA_REQUIRE_BMI2
++    need(ebx7 & (1u << 8), "BMI2");
++#endif
++#ifdef LAYA_REQUIRE_AVX512F
++    need((ebx7 & (1u << 16)) && zmm_os, "AVX512F");
++#endif
++    (void)ebx7; (void)zmm_os;
++#endif
++    return missing;
++}
++
++#ifdef _WIN32
++// Diagnostics: with LAYA_CRASH_REPORT=1 in the environment, hardware exceptions (access violation,
++// illegal instruction, stack overflow, ...) are reported to stderr and laya-crash.txt with module
++// offsets and a stack trace before the host handles them. Offsets map to source lines with
++// addr2line against the matching unstripped build.
++void describe_address(char* out, size_t size, void* address) {
++    HMODULE module = nullptr;
++    char name[MAX_PATH] = "?";
++    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                           static_cast<LPCSTR>(address), &module) && module) {
++        GetModuleFileNameA(module, name, sizeof name);
++        const char* base = std::strrchr(name, '\\');
++        std::snprintf(out, size, "%s+0x%llx", base ? base + 1 : name,
++                      static_cast<unsigned long long>(static_cast<char*>(address) - reinterpret_cast<char*>(module)));
++    } else {
++        std::snprintf(out, size, "%p", address);
++    }
++}
++LONG CALLBACK crash_reporter(EXCEPTION_POINTERS* info) {
++    const DWORD code = info->ExceptionRecord->ExceptionCode;
++    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
++        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
++        code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_IN_PAGE_ERROR &&
++        code != EXCEPTION_DATATYPE_MISALIGNMENT && code != STATUS_FLOAT_INVALID_OPERATION &&
++        code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED)
++        return EXCEPTION_CONTINUE_SEARCH;
++    static std::atomic<int> reported{0};
++    if (reported++ > 2) return EXCEPTION_CONTINUE_SEARCH;
++    char where[512], line[640];
++    std::string report;
++    describe_address(where, sizeof where, info->ExceptionRecord->ExceptionAddress);
++    std::snprintf(line, sizeof line, "laya_c %s crash report: exception 0x%08lx at %s thread %lu\n", LAYA_C_VERSION,
++                  static_cast<unsigned long>(code), where, static_cast<unsigned long>(GetCurrentThreadId()));
++    report += line;
++    if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) && info->ExceptionRecord->NumberParameters >= 2) {
++        std::snprintf(line, sizeof line, "  %s address 0x%llx\n",
++                      info->ExceptionRecord->ExceptionInformation[0] == 0 ? "reading" :
++                      info->ExceptionRecord->ExceptionInformation[0] == 1 ? "writing" : "executing",
++                      static_cast<unsigned long long>(info->ExceptionRecord->ExceptionInformation[1]));
++        report += line;
++    }
++    void* frames[48];
++    const USHORT count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
++    for (USHORT i = 0; i < count; ++i) {
++        describe_address(where, sizeof where, frames[i]);
++        std::snprintf(line, sizeof line, "  #%02u %s\n", unsigned(i), where);
++        report += line;
++    }
++    std::fputs(report.c_str(), stderr);
++    std::fflush(stderr);
++    if (FILE* file = std::fopen("laya-crash.txt", "a")) { std::fputs(report.c_str(), file); std::fclose(file); }
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++#endif
++
+ void install_hooks() {
+     static std::once_flag once;
+     std::call_once(once, [] {
+         ggml_log_set(forward_log, nullptr);
+         ggml_set_abort_callback(forward_abort);
++#ifdef _WIN32
++        if (const char* flag = std::getenv("LAYA_CRASH_REPORT"); flag && *flag && *flag != '0')
++            AddVectoredExceptionHandler(1, crash_reporter);
++#endif
+     });
+ }
+ 
+@@ -139,6 +262,9 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+     last_error.clear();
+     install_hooks();
+     try {
++        if (const auto missing = missing_cpu_features(); !missing.empty())
++            throw std::runtime_error("This laya build needs CPU instructions your processor (or virtual machine) "
++                                     "does not provide: " + missing + ". Use a build for an older CPU baseline.");
+         if (!model_dir || !*model_dir) throw std::invalid_argument("model_dir is empty");
+         const auto options = options_json && *options_json ? laya::json::parse(options_json) : laya::json::object();
+         if (!options.is_object()) throw std::invalid_argument("options_json must be a JSON object");
+diff --git a/tests/capi/make_synthetic_model.py b/tests/capi/make_synthetic_model.py
+index 164a768..817b82b 100644
+--- a/tests/capi/make_synthetic_model.py
++++ b/tests/capi/make_synthetic_model.py
+@@ -13,7 +13,7 @@ import argparse, json, os, struct
+ import numpy as np
+ 
+ WIDTH, HEADS, LAYERS, INTER, VOCAB = 1024, 16, 28, 2624, 50368
+-ACT_COSTS = [0.0, 0.1, 0.2]  # three costs -> four action logits
++ACT_COSTS = {"escalate": 0.5}  # as in the published checkpoint: one cost -> two action logits
+ 
+ 
+ def tensor_specs():
+@@ -128,9 +128,14 @@ def write_configs(out):
+                             "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}},
+     }
+     json.dump(encoder, open(os.path.join(out, "encoder", "config.json"), "w"), indent=1)
+-    agent = {"model_name": "laya-synthetic-test", "encoder": "answerdotai/ModernBERT-large",
+-             "head_layers": 2, "amp_dtype": "bf16", "max_len": 512, "head_max_len": 192,
+-             "act_costs": ACT_COSTS, "temperature": [1.0, 1.0, 1.0]}
++    # Mirrors the published english checkpoint's rl_agent_config.json (training stats omitted).
++    agent = {"encoder": "/kaggle/input/notebooks/nandukuttan/rl-agent-asset/models/ModernBERT-large",
++             "head_layers": 2, "max_len": 512, "head_max_len": 192, "max_prefixes": 6,
++             "act_costs": ACT_COSTS, "cost_wrong_act": 3.0, "amp_dtype": "bf16", "model_name": "rl-agent",
++             "temperature": [1.6369030475616455, 1.2514300346374512, 1.983399510383606],
++             "temperature_by_options": {"choice:3-5": 1.7601518630981445, "choice:6-10": 1.0000158548355103,
++                                        "score:3-5": 1.2514300346374512, "noul:2": 1.983399510383606,
++                                        "choice:11+": 0.10058280825614929, "choice:2": 1.9063563346862793}}
+     json.dump(agent, open(os.path.join(out, "rl_agent_config.json"), "w"), indent=1)
+ 
+ 
+-- 
+2.43.0
+

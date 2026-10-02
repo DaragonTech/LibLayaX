@@ -1,0 +1,100 @@
+From 2319f5e58d4d1545e15a143aa596a5496f60f27c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 22:20:19 +0100
+Subject: [PATCH 19/30] Windows build script: avx2/compat/vulkan variants with
+ tools
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ scripts/capi/build-windows-mingw.sh | 69 +++++++++++++++++++----------
+ 1 file changed, 45 insertions(+), 24 deletions(-)
+
+diff --git a/scripts/capi/build-windows-mingw.sh b/scripts/capi/build-windows-mingw.sh
+index 1990901..9285667 100755
+--- a/scripts/capi/build-windows-mingw.sh
++++ b/scripts/capi/build-windows-mingw.sh
+@@ -1,9 +1,10 @@
+ #!/usr/bin/env bash
+-# Reproducible cross-build of laya.dll (Windows x64, CPU backend) on Ubuntu 24.04 / Debian.
+-# Produces build-win/bin/laya.dll with no runtime dependencies beyond Windows system DLLs
+-# (MinGW runtime, libstdc++, winpthread and ICU are linked statically).
++# Reproducible cross-build of laya.dll (Windows x64) on Ubuntu 24.04 / Debian: build-win-<variant>/bin/laya.dll
++# with no runtime dependencies beyond Windows system DLLs (MinGW runtime, libstdc++, winpthread and
++# ICU are linked statically).
+ #
+-#   scripts/capi/build-windows-mingw.sh            # build
++#   scripts/capi/build-windows-mingw.sh                    # avx2 + compat
++#   VARIANTS="avx2 compat vulkan" VULKAN_HEADERS=... SPIRV_HEADERS=... GLSLC=... VULKAN_DEF=... scripts/capi/build-windows-mingw.sh
+ #   RUN_TESTS=1 LAYA_TEST_MODEL=/path/to/checkpoint scripts/capi/build-windows-mingw.sh
+ #
+ # Needs: apt install mingw-w64 cmake ninja-build nlohmann-json3-dev curl  (+ wine64 for tests)
+@@ -36,25 +37,45 @@ if [ ! -d nl/include/nlohmann ]; then
+   cp -r /usr/share/cmake/nlohmann_json nl/share/cmake/ && cp -r /usr/include/nlohmann nl/include/
+ fi
+ 
+-# 3. laya.dll (AVX2/FMA/F16C baseline: any x86-64 CPU since ~2013-2015).
++# 3. One build per variant: build-win-<variant>/bin/laya.dll
++#   avx2    cpu backend, AVX2/FMA/F16C/BMI2 baseline (Intel 2013+, AMD Zen+)
++#   compat  cpu backend, SSE4.2 baseline (any x86-64 since ~2009; Windows on ARM x64 emulation)
++#   vulkan  cpu (avx2) + vulkan backends. vulkan-1.dll is delay-loaded, so the DLL also loads on
++#           PCs without Vulkan. Needs VULKAN_HEADERS (Vulkan-Headers/include), SPIRV_HEADERS
++#           (SPIRV-Headers/include), GLSLC (shaderc >= 2025.3) and VULKAN_DEF (a .def listing the
++#           exports of vulkan-1.dll, e.g. generated from Wine's or the SDK's vulkan-1.dll).
+ I=$WORK/icu-win
+-cmake -S "$ROOT" -B "$ROOT/build-win" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+-  -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/toolchains/mingw-w64-x86_64.cmake" \
+-  -DLAYA_CUDA=OFF -DLAYA_C_API=ON -DBUILD_SHARED_LIBS=OFF \
+-  -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
+-  -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF \
+-  -DICU_ROOT="$I" -DICU_INCLUDE_DIR="$I/include" -DICU_UC_LIBRARY_RELEASE="$I/lib/libsicuuc.a" \
+-  -DICU_I18N_LIBRARY_RELEASE="$I/lib/libsicuin.a" -DICU_DATA_LIBRARY_RELEASE="$I/lib/libsicudt.a" \
+-  -DCMAKE_CXX_FLAGS="-DU_STATIC_IMPLEMENTATION" -Dnlohmann_json_DIR="$WORK/nl/share/cmake/nlohmann_json"
+-cmake --build "$ROOT/build-win" --parallel "$JOBS" --target laya_c test-capi laya-cli
+-x86_64-w64-mingw32-strip --strip-unneeded "$ROOT/build-win/bin/laya.dll"
+-x86_64-w64-mingw32-objdump -p "$ROOT/build-win/bin/laya.dll" | grep "DLL Name"
+-echo "built $ROOT/build-win/bin/laya.dll"
++VERSION=${LAYA_C_VERSION:-1.0.9}
++for variant in ${VARIANTS:-avx2 compat}; do
++  cxxflags="-DU_STATIC_IMPLEMENTATION"
++  case $variant in
++    avx2)   isa=(-DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON) ;;
++    compat) isa=(-DGGML_SSE42=ON -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF) ;;
++    vulkan) mkdir -p "$WORK/vk-mingw"
++            x86_64-w64-mingw32-dlltool -d "${VULKAN_DEF:?set VULKAN_DEF}" -y "$WORK/vk-mingw/libvulkan-1-delay.a" -D vulkan-1.dll
++            cxxflags="$cxxflags -I${SPIRV_HEADERS:?set SPIRV_HEADERS}"
++            isa=(-DLAYA_VULKAN=ON -DVulkan_INCLUDE_DIR="${VULKAN_HEADERS:?set VULKAN_HEADERS}"
++                 -DVulkan_LIBRARY="$WORK/vk-mingw/libvulkan-1-delay.a" -DVulkan_GLSLC_EXECUTABLE="${GLSLC:-glslc}"
++                 -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON) ;;
++    *) echo "unknown variant $variant" >&2; exit 1 ;;
++  esac
++  B=$ROOT/build-win-$variant
++  cmake -S "$ROOT" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
++    -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/toolchains/mingw-w64-x86_64.cmake" \
++    -DLAYA_CUDA=OFF -DLAYA_C_API=ON -DBUILD_SHARED_LIBS=OFF -DLAYA_C_VERSION="$VERSION" \
++    -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF "${isa[@]}" \
++    -DICU_ROOT="$I" -DICU_INCLUDE_DIR="$I/include" -DICU_UC_LIBRARY_RELEASE="$I/lib/libsicuuc.a" \
++    -DICU_I18N_LIBRARY_RELEASE="$I/lib/libsicuin.a" -DICU_DATA_LIBRARY_RELEASE="$I/lib/libsicudt.a" \
++    "-DCMAKE_CXX_FLAGS=$cxxflags" -Dnlohmann_json_DIR="$WORK/nl/share/cmake/nlohmann_json"
++  cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi laya-bench laya-diag laya-cli
++  x86_64-w64-mingw32-strip --strip-unneeded "$B/bin/laya.dll"
++  echo "== $variant: $B/bin/laya.dll"
++  x86_64-w64-mingw32-objdump -p "$B/bin/laya.dll" | grep "DLL Name"
+ 
+-# 4. Optional: run the C test suite under Wine.
+-if [ "${RUN_TESTS:-0}" = 1 ]; then
+-  export WINEDEBUG=-all
+-  model=""
+-  [ -n "${LAYA_TEST_MODEL:-}" ] && model="Z:${LAYA_TEST_MODEL//\//\\}"
+-  (cd "$ROOT/build-win/bin" && LAYA_TEST_MODEL="$model" wine test-capi.exe) || [ $? = 77 ]
+-fi
++  # Optional: run the C test suite under Wine (cpu backend).
++  if [ "${RUN_TESTS:-0}" = 1 ]; then
++    model=""
++    [ -n "${LAYA_TEST_MODEL:-}" ] && model="Z:${LAYA_TEST_MODEL//\//\\}"
++    (cd "$B/bin" && WINEDEBUG=-all LAYA_TEST_MODEL="$model" wine test-capi.exe) || [ $? = 77 ]
++  fi
++done
+-- 
+2.43.0
+

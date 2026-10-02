@@ -1,0 +1,261 @@
+From fda14dc5cac608b2cf1f9ae84acad73ecaa91ec9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 2 Oct 2026 00:30:35 +0100
+Subject: [PATCH 23/30] ARM64 diagnostics: load trace, FP registers in the
+ trace, engine start-up in laya-probe, ggml trace patch
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt          |   2 +-
+ capi/laya_c.cpp              |  17 +++++-
+ capi/patches/ggml-trace.diff | 110 +++++++++++++++++++++++++++++++++++
+ scripts/capi/build-arm64.sh  |   2 +-
+ tests/capi/probe.cpp         |  38 ++++++++++++
+ 5 files changed, 165 insertions(+), 4 deletions(-)
+ create mode 100644 capi/patches/ggml-trace.diff
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index e065705..74cf0fa 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ # Flat C ABI shared library over laya.cpp: laya.dll (Windows), liblaya.so (Linux), liblaya.dylib (macOS).
+ # Enable from the top level with -DLAYA_C_API=ON. Build ggml statically (-DBUILD_SHARED_LIBS=OFF)
+ # to get a single self-contained library.
+-set(LAYA_C_VERSION "1.0.11" CACHE STRING "Version string reported by laya_version()")
++set(LAYA_C_VERSION "1.0.12" CACHE STRING "Version string reported by laya_version()")
+ 
+ add_library(laya_c SHARED laya_c.cpp)
+ target_include_directories(laya_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index 024fdf9..0ecad21 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -142,6 +142,19 @@ bool debug_enabled() {
+     static const bool enabled = [] { const char* flag = std::getenv("LAYA_DEBUG"); return flag && *flag && *flag != '0'; }();
+     return enabled;
+ }
++// The floating-point control and status registers, for the trace ("" where not implemented).
++std::string fp_registers() {
++#if defined(__aarch64__) && !defined(_MSC_VER)
++    unsigned long long fpcr = 0, fpsr = 0;
++    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
++    __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
++    char text[64];
++    std::snprintf(text, sizeof text, "fpcr=%08llx fpsr=%08llx", fpcr, fpsr);
++    return text;
++#else
++    return "";
++#endif
++}
+ void debug(const char* text, const char* detail = nullptr) {
+     if (!debug_enabled()) return;
+     std::fprintf(stderr, detail ? "[laya] %s: %s\n" : "[laya] %s\n", text, detail);
+@@ -342,9 +355,9 @@ LAYA_API void LAYA_CALL laya_set_log_callback(laya_log_fn fn, void* user, int mi
+ }
+ 
+ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* options_json) {
+-    debug("create: enter");
++    debug("create: enter", debug_enabled() ? fp_registers().c_str() : nullptr);
+     call_guard fp;
+-    debug("create: floating-point guard set");
++    debug("create: floating-point guard set", debug_enabled() ? fp_registers().c_str() : nullptr);
+     clear_last_error();
+     debug("create: thread-local error text cleared");
+     install_hooks();
+diff --git a/capi/patches/ggml-trace.diff b/capi/patches/ggml-trace.diff
+new file mode 100644
+index 0000000..74a1b30
+--- /dev/null
++++ b/capi/patches/ggml-trace.diff
+@@ -0,0 +1,110 @@
++diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
++index 87a329f..622132d 100644
++--- a/src/ggml-cpu/ggml-cpu.c
+++++ b/src/ggml-cpu/ggml-cpu.c
++@@ -3856,15 +3856,27 @@ int ggml_cpu_has_sme2(void) {
++ #endif
++ }
++ 
+++// LAYA_DEBUG=1 progress lines (diagnostic patch, see capi/patches/ggml-trace.diff)
+++static void laya_ggml_trace(const char * text, int value) {
+++    const char * flag = getenv("LAYA_DEBUG");
+++    if (!flag || !*flag || *flag == '0') return;
+++    fprintf(stderr, "[laya] ggml: %s %d\n", text, value);
+++    fflush(stderr);
+++}
+++
++ void ggml_cpu_init(void) {
+++    laya_ggml_trace("cpu_init: enter", 0);
++     // needed to initialize ggml_time
++     {
++         struct ggml_init_params params = { 0, NULL, false };
++         struct ggml_context * ctx = ggml_init(params);
+++        laya_ggml_trace("cpu_init: ggml_init returned", ctx != NULL);
++         ggml_free(ctx);
++     }
++ 
+++    laya_ggml_trace("cpu_init: taking the lock", 0);
++     ggml_critical_section_start();
+++    laya_ggml_trace("cpu_init: lock taken", 0);
++ 
++     static bool is_first_call = true;
++ 
++@@ -3874,6 +3886,7 @@ void ggml_cpu_init(void) {
++             const uint64_t t_start = ggml_time_us(); UNUSED(t_start);
++ 
++             for (int i = 0; i < (1 << 16); ++i) {
+++                if ((i & 0xfff) == 0) laya_ggml_trace("cpu_init: half-float tables, entry", i);
++                 union {
++                     uint16_t u16;
++                     ggml_fp16_t fp16;
++@@ -3916,6 +3929,7 @@ void ggml_cpu_init(void) {
++ #endif
++         }
++ 
+++        laya_ggml_trace("cpu_init: tables done", 0);
++ #if defined(__ARM_ARCH)
++         ggml_init_arm_arch_features();
++ #endif
++@@ -3933,4 +3947,5 @@ void ggml_cpu_init(void) {
++     }
++ 
++     ggml_critical_section_end();
+++    laya_ggml_trace("cpu_init: done", 0);
++ }
++diff --git a/src/ggml-cpu/ggml-cpu.cpp b/src/ggml-cpu/ggml-cpu.cpp
++index 8cece71..8047c3b 100644
++--- a/src/ggml-cpu/ggml-cpu.cpp
+++++ b/src/ggml-cpu/ggml-cpu.cpp
++@@ -214,9 +214,18 @@ static ggml_guid_t ggml_backend_cpu_guid(void) {
++     return &guid;
++ }
++ 
+++static void laya_ggml_trace_cpp(const char * text) {
+++    const char * flag = getenv("LAYA_DEBUG");
+++    if (!flag || !*flag || *flag == '0') return;
+++    fprintf(stderr, "[laya] ggml: %s\n", text);
+++    fflush(stderr);
+++}
+++
++ ggml_backend_t ggml_backend_cpu_init(void) {
++     // initialize CPU backend now to avoid slowing the first graph computation
+++    laya_ggml_trace_cpp("backend_cpu_init: enter");
++     ggml_cpu_init();
+++    laya_ggml_trace_cpp("backend_cpu_init: registering the device (reads the CPU name from the registry)");
++ 
++     struct ggml_backend_cpu_context * ctx = new ggml_backend_cpu_context;
++     if (ctx == NULL) {
++@@ -243,6 +252,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
++         return NULL;
++     }
++ 
+++    laya_ggml_trace_cpp("backend_cpu_init: done");
++     return cpu_backend;
++ }
++ 
++diff --git a/src/ggml.c b/src/ggml.c
++index 5ef03e1..657d04e 100644
++--- a/src/ggml.c
+++++ b/src/ggml.c
++@@ -1610,8 +1610,12 @@ static inline bool ggml_can_repeat_rows(const struct ggml_tensor * t0, const str
++ 
++ struct ggml_context * ggml_init(struct ggml_init_params params) {
++     static bool is_first_call = true;
+++    const char * laya_flag = is_first_call ? getenv("LAYA_DEBUG") : NULL;
+++    const bool laya_trace = laya_flag && *laya_flag && *laya_flag != '0';
+++    if (laya_trace) { fputs("[laya] ggml: init: taking the lock\n", stderr); fflush(stderr); }
++ 
++     ggml_critical_section_start();
+++    if (laya_trace) { fputs("[laya] ggml: init: lock taken, starting the timer\n", stderr); fflush(stderr); }
++ 
++     if (is_first_call) {
++         // initialize time system (required on Windows)
++@@ -1621,6 +1625,7 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
++     }
++ 
++     ggml_critical_section_end();
+++    if (laya_trace) { fputs("[laya] ggml: init: lock released\n", stderr); fflush(stderr); }
++ 
++     struct ggml_context * ctx = GGML_MALLOC(sizeof(struct ggml_context));
++ 
+diff --git a/scripts/capi/build-arm64.sh b/scripts/capi/build-arm64.sh
+index 9635b95..ce7ce08 100755
+--- a/scripts/capi/build-arm64.sh
++++ b/scripts/capi/build-arm64.sh
+@@ -19,7 +19,7 @@ set -euo pipefail
+ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ WORK=${WORK:-$ROOT/build-deps}
+ JOBS=${JOBS:-$(nproc)}
+-VERSION=${LAYA_C_VERSION:-1.0.11}
++VERSION=${LAYA_C_VERSION:-1.0.12}
+ ICU_VERSION=${ICU_VERSION:-76-1}
+ ICU_TGZ=icu4c-${ICU_VERSION/-/_}-src.tgz
+ W=$ROOT/cmake/toolchains/zig
+diff --git a/tests/capi/probe.cpp b/tests/capi/probe.cpp
+index e33c5f5..aaf2e6b 100644
+--- a/tests/capi/probe.cpp
++++ b/tests/capi/probe.cpp
+@@ -4,6 +4,8 @@
+ // the last line shows which feature is broken on this machine.
+ #include <atomic>
+ #include <cfenv>
++#include <cmath>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+ #include <mutex>
+@@ -31,6 +33,39 @@ NOINLINE static void thrower(int depth, const std::string& text) {
+     else throw std::invalid_argument(local);
+ }
+ 
++// The start-up work of the CPU engine: a 65536-entry table over every half-float bit pattern
++// (NaNs, infinities and denormals included), using tanhf/expf and float<->half conversions.
++static volatile float table_sink;
++NOINLINE static void math_table() {
++    for (int i = 0; i < (1 << 16); ++i) {
++        float f;
++#if defined(__aarch64__) && !defined(_MSC_VER)
++        std::uint16_t bits = static_cast<std::uint16_t>(i);
++        __fp16 half;
++        std::memcpy(&half, &bits, sizeof half);
++        f = static_cast<float>(half);
++#else
++        f = static_cast<float>(i - 32768) / 64.0f;
++#endif
++        const float gelu = 0.5f * f * (1.0f + std::tanh(0.79788456f * f * (1.0f + 0.044715f * f * f)));
++        const float quick = f * (1.0f / (1.0f + std::exp(-1.702f * f)));
++#if defined(__aarch64__) && !defined(_MSC_VER)
++        __fp16 back = static_cast<__fp16>(gelu + quick);
++        table_sink = static_cast<float>(back);
++#else
++        table_sink = gelu + quick;
++#endif
++    }
++}
++static void print_fp_registers() {
++#if defined(__aarch64__) && !defined(_MSC_VER)
++    unsigned long long fpcr = 0, fpsr = 0;
++    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
++    __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
++    std::printf("(fpcr=%08llx fpsr=%08llx) ", fpcr, fpsr);
++#endif
++}
++
+ int main() {
+     std::printf("laya-probe (%s)\n",
+ #if defined(__aarch64__) || defined(_M_ARM64)
+@@ -42,6 +77,9 @@ int main() {
+     step("atomic increment"); ++counter; --counter; ok();
+     step("thread-local storage"); std::strcpy(thread_text, "hello"); ok();
+     step("floating-point environment"); { std::fenv_t saved; std::feholdexcept(&saved); std::fesetenv(&saved); } ok();
++    step("math table (65536 x tanhf/expf/half-float)"); print_fp_registers(); math_table(); print_fp_registers(); ok();
++    step("math table inside feholdexcept"); { std::fenv_t saved; std::feholdexcept(&saved); print_fp_registers(); math_table(); std::fesetenv(&saved); print_fp_registers(); } ok();
++    step("math table after the guard"); math_table(); ok();
+     step("call_once"); { static std::once_flag once; std::call_once(once, [] { ++counter; }); } ok();
+     step("mutex"); { std::lock_guard<std::mutex> guard(lock); ++counter; } ok();
+     step("throw int, catch in the same function");
+-- 
+2.43.0
+

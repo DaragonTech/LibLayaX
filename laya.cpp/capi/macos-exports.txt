@@ -1,0 +1,10 @@
+_laya_version
+_laya_api_version
+_laya_set_log_callback
+_laya_create
+_laya_predict
+_laya_prepare
+_laya_info
+_laya_free_string
+_laya_destroy
+_laya_last_error

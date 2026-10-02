@@ -1,0 +1,437 @@
+From 768fb974eada692b79f3c92a41fe8dbf3413843c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 19:41:59 +0100
+Subject: [PATCH 08/30] capi: macOS dylib cross-build with Zig (arm64, x86_64
+ avx2/compat), Delphi macOS support
+
+- cmake/toolchains/zig-macos.cmake + zig wrappers; tzfile.h stub for ICU
+- scripts/capi/build-macos.sh: static ICU per arch, final link with ld64.lld
+  (exact export list, @rpath install name, ad-hoc signature)
+- capi CMake: @rpath install name and export list on Apple
+- tests: portable FP unmasking (macOS x86_64 via registers; arm64 has no traps)
+- Laya.pas: liblaya.dylib on macOS; LayaTests: MXCSR check only on x64
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt                       | 10 ++-
+ capi/laya_c.cpp                           |  4 +-
+ capi/macos-exports.txt                    | 10 +++
+ cmake/toolchains/zig-macos-rules.cmake    |  5 ++
+ cmake/toolchains/zig-macos.cmake          | 36 +++++++++
+ cmake/toolchains/zig/macos-stubs/tzfile.h |  7 ++
+ cmake/toolchains/zig/zigar                |  3 +
+ cmake/toolchains/zig/zigcc                | 23 ++++++
+ cmake/toolchains/zig/zigcc-aarch64-macos  |  1 +
+ cmake/toolchains/zig/zigcc-x86_64-macos   |  1 +
+ cmake/toolchains/zig/zigcxx               | 23 ++++++
+ cmake/toolchains/zig/zigcxx-aarch64-macos |  1 +
+ cmake/toolchains/zig/zigcxx-x86_64-macos  |  1 +
+ cmake/toolchains/zig/zigranlib            |  3 +
+ scripts/capi/build-macos.sh               | 97 +++++++++++++++++++++++
+ tests/capi/test_capi.c                    | 19 +++++
+ 16 files changed, 242 insertions(+), 2 deletions(-)
+ create mode 100644 capi/macos-exports.txt
+ create mode 100644 cmake/toolchains/zig-macos-rules.cmake
+ create mode 100644 cmake/toolchains/zig-macos.cmake
+ create mode 100644 cmake/toolchains/zig/macos-stubs/tzfile.h
+ create mode 100755 cmake/toolchains/zig/zigar
+ create mode 100755 cmake/toolchains/zig/zigcc
+ create mode 120000 cmake/toolchains/zig/zigcc-aarch64-macos
+ create mode 120000 cmake/toolchains/zig/zigcc-x86_64-macos
+ create mode 100755 cmake/toolchains/zig/zigcxx
+ create mode 120000 cmake/toolchains/zig/zigcxx-aarch64-macos
+ create mode 120000 cmake/toolchains/zig/zigcxx-x86_64-macos
+ create mode 100755 cmake/toolchains/zig/zigranlib
+ create mode 100755 scripts/capi/build-macos.sh
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index 7f3acf4..a071328 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -29,7 +29,13 @@ endif()
+ if(MINGW)
+   # A Delphi/.NET host has no MinGW runtime: fold libgcc, libstdc++ and winpthread into the DLL.
+   target_link_options(laya_c PRIVATE -static-libgcc -static-libstdc++ -static -Wl,--exclude-all-symbols)
+-elseif(UNIX AND NOT APPLE)
++elseif(APPLE)
++  # Found next to the app via @rpath (e.g. Contents/MacOS or Contents/Frameworks), exporting only
++  # the C API. Apple's linker honours the list; the zig cross build relinks with ld64.lld
++  # (scripts/capi/build-macos.sh) because zig's linker ignores it.
++  set_target_properties(laya_c PROPERTIES INSTALL_NAME_DIR "@rpath" BUILD_WITH_INSTALL_NAME_DIR ON)
++  target_link_options(laya_c PRIVATE -Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/macos-exports.txt -Wl,-dead_strip)
++elseif(UNIX)
+   target_link_options(laya_c PRIVATE -Wl,--exclude-libs,ALL -Wl,--no-undefined)
+ endif()
+ 
+@@ -39,6 +45,8 @@ if(BUILD_TESTING)
+   target_link_libraries(test-capi PRIVATE laya_c)
+   if(MINGW)
+     target_link_options(test-capi PRIVATE -static)
++  elseif(APPLE)
++    set_target_properties(test-capi PROPERTIES BUILD_RPATH "@executable_path")
+   elseif(UNIX)
+     find_package(Threads REQUIRED)
+     target_link_libraries(test-capi PRIVATE Threads::Threads m)
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index 75dbb0f..5c163d1 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -69,6 +69,7 @@ void clear_last_error() { last_error_text[0] = '\0'; }
+ // non-zero are ggml workers spawned for that call; they get FP exceptions masked too (DllMain).
+ std::atomic<int> calls_in_progress{0};
+ 
++#ifdef _WIN32  // used by DllMain only
+ inline void mask_fp_exceptions_on_this_thread() {
+ #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+     unsigned short cw;
+@@ -84,6 +85,7 @@ inline void mask_fp_exceptions_on_this_thread() {
+     _mm_setcsr((_mm_getcsr() | 0x1F80u) & ~0x3Fu);
+ #endif
+ }
++#endif
+ 
+ struct fp_guard {
+ #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+@@ -192,7 +194,7 @@ std::string missing_cpu_features() {
+ #ifdef LAYA_REQUIRE_AVX512F
+     need((ebx7 & (1u << 16)) && zmm_os, "AVX512F");
+ #endif
+-    (void)ebx7; (void)zmm_os;
++    (void)ebx7; (void)zmm_os; (void)ymm_os; (void)need;
+ #endif
+     return missing;
+ }
+diff --git a/capi/macos-exports.txt b/capi/macos-exports.txt
+new file mode 100644
+index 0000000..813bb73
+--- /dev/null
++++ b/capi/macos-exports.txt
+@@ -0,0 +1,10 @@
++_laya_version
++_laya_api_version
++_laya_set_log_callback
++_laya_create
++_laya_predict
++_laya_prepare
++_laya_info
++_laya_free_string
++_laya_destroy
++_laya_last_error
+diff --git a/cmake/toolchains/zig-macos-rules.cmake b/cmake/toolchains/zig-macos-rules.cmake
+new file mode 100644
+index 0000000..35583c9
+--- /dev/null
++++ b/cmake/toolchains/zig-macos-rules.cmake
+@@ -0,0 +1,5 @@
++# Loaded by zig-macos.cmake through CMAKE_USER_MAKE_RULES_OVERRIDE (after CMake's Darwin files).
++set(CMAKE_SHARED_LIBRARY_RUNTIME_C_FLAG "-Wl,-rpath,")
++set(CMAKE_SHARED_LIBRARY_RUNTIME_CXX_FLAG "-Wl,-rpath,")
++set(CMAKE_EXECUTABLE_RUNTIME_C_FLAG "-Wl,-rpath,")
++set(CMAKE_EXECUTABLE_RUNTIME_CXX_FLAG "-Wl,-rpath,")
+diff --git a/cmake/toolchains/zig-macos.cmake b/cmake/toolchains/zig-macos.cmake
+new file mode 100644
+index 0000000..b355354
+--- /dev/null
++++ b/cmake/toolchains/zig-macos.cmake
+@@ -0,0 +1,36 @@
++# Cross-compile macOS binaries (liblaya.dylib) from Linux with Zig (pip install ziglang).
++#   ZIG=/path/to/zig  LAYA_MACOS_ARCH=arm64|x86_64  cmake -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/zig-macos.cmake ...
++# Zig bundles the macOS libSystem stubs and libc++, so no Apple SDK is needed. Frameworks
++# (Metal, Accelerate, CoreML) are not available this way: these are CPU builds.
++set(CMAKE_SYSTEM_NAME Darwin)
++if(NOT DEFINED LAYA_MACOS_ARCH)
++  set(LAYA_MACOS_ARCH "$ENV{LAYA_MACOS_ARCH}")
++endif()
++if(LAYA_MACOS_ARCH STREQUAL "x86_64")
++  set(CMAKE_SYSTEM_PROCESSOR x86_64)
++  set(_zig_arch x86_64)
++else()
++  set(CMAKE_SYSTEM_PROCESSOR arm64)
++  set(_zig_arch aarch64)
++endif()
++set(CMAKE_OSX_ARCHITECTURES "" CACHE STRING "" FORCE)  # zig takes the arch from ZIG_TARGET
++set(CMAKE_OSX_SYSROOT "" CACHE PATH "" FORCE)          # no SDK; zig provides libSystem
++set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "" FORCE)  # also enables CMake's @rpath support
++# Per-architecture wrapper names carry the target, so every step (compile and link) gets it.
++set(CMAKE_C_COMPILER   ${CMAKE_CURRENT_LIST_DIR}/zig/zigcc-${_zig_arch}-macos)
++set(CMAKE_CXX_COMPILER ${CMAKE_CURRENT_LIST_DIR}/zig/zigcxx-${_zig_arch}-macos)
++set(CMAKE_AR           ${CMAKE_CURRENT_LIST_DIR}/zig/zigar CACHE FILEPATH "")
++set(CMAKE_RANLIB       ${CMAKE_CURRENT_LIST_DIR}/zig/zigranlib CACHE FILEPATH "")
++set(CMAKE_INSTALL_NAME_TOOL true CACHE FILEPATH "")
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
++set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
++# Apple Silicon baseline: M1 (zig names CPUs, so -mcpu rather than ggml's -march).
++if(_zig_arch STREQUAL "aarch64")
++  set(CMAKE_C_FLAGS_INIT   "-mcpu=apple_m1")
++  set(CMAKE_CXX_FLAGS_INIT "-mcpu=apple_m1")
++endif()
++# CMake learns the macOS version from sw_vers, which a Linux host lacks, and then withholds
++# @rpath support. Restore the flags it uses for any macOS since 10.5, after its platform files.
++set(CMAKE_USER_MAKE_RULES_OVERRIDE ${CMAKE_CURRENT_LIST_DIR}/zig-macos-rules.cmake)
+diff --git a/cmake/toolchains/zig/macos-stubs/tzfile.h b/cmake/toolchains/zig/macos-stubs/tzfile.h
+new file mode 100644
+index 0000000..8289faa
+--- /dev/null
++++ b/cmake/toolchains/zig/macos-stubs/tzfile.h
+@@ -0,0 +1,7 @@
++/* Minimal stand-in for the macOS SDK's <tzfile.h>, which zig's bundled macOS headers lack.
++ * ICU's putil.cpp only needs these two paths. */
++#ifndef LAYA_STUB_TZFILE_H
++#define LAYA_STUB_TZFILE_H
++#define TZDIR "/usr/share/zoneinfo"
++#define TZDEFAULT "/etc/localtime"
++#endif
+diff --git a/cmake/toolchains/zig/zigar b/cmake/toolchains/zig/zigar
+new file mode 100755
+index 0000000..838c25d
+--- /dev/null
++++ b/cmake/toolchains/zig/zigar
+@@ -0,0 +1,3 @@
++#!/bin/sh
++ZIG=${ZIG:-$(command -v zig || python3 -c "import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),'zig'))")}
++exec "$ZIG" ar "$@"
+diff --git a/cmake/toolchains/zig/zigcc b/cmake/toolchains/zig/zigcc
+new file mode 100755
+index 0000000..355f992
+--- /dev/null
++++ b/cmake/toolchains/zig/zigcc
+@@ -0,0 +1,23 @@
++#!/bin/sh
++# `zig cc` for cross builds (macOS from Linux). Target from ZIG_TARGET, e.g. aarch64-macos.11.0.
++# Drops Apple-toolchain flags zig does not understand; the target already implies them.
++ZIG=${ZIG:-$(command -v zig || python3 -c "import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),'zig'))")}
++args=""
++skip=""
++for a in "$@"; do
++  if [ -n "$skip" ]; then skip=""; continue; fi
++  case "$a" in
++    -arch|-isysroot) skip=1 ;;
++    -mmacosx-version-min=*|--target=*|-target=*) ;;
++    *) args="$args '$(printf %s "$a" | sed "s/'/'\\\\''/g")'" ;;
++  esac
++done
++# Target: ZIG_TARGET, else from the wrapper name (zigcc-aarch64-macos -> aarch64-macos.11.0).
++if [ -z "$ZIG_TARGET" ]; then
++  case "$(basename "$0")" in
++    *-aarch64-macos) ZIG_TARGET=aarch64-macos.11.0 ;;
++    *-x86_64-macos)  ZIG_TARGET=x86_64-macos.11.0 ;;
++    *) echo "$0: set ZIG_TARGET" >&2; exit 1 ;;
++  esac
++fi
++eval exec "$ZIG" cc -target "$ZIG_TARGET" $args
+diff --git a/cmake/toolchains/zig/zigcc-aarch64-macos b/cmake/toolchains/zig/zigcc-aarch64-macos
+new file mode 120000
+index 0000000..b2fc811
+--- /dev/null
++++ b/cmake/toolchains/zig/zigcc-aarch64-macos
+@@ -0,0 +1 @@
++zigcc
+\ No newline at end of file
+diff --git a/cmake/toolchains/zig/zigcc-x86_64-macos b/cmake/toolchains/zig/zigcc-x86_64-macos
+new file mode 120000
+index 0000000..b2fc811
+--- /dev/null
++++ b/cmake/toolchains/zig/zigcc-x86_64-macos
+@@ -0,0 +1 @@
++zigcc
+\ No newline at end of file
+diff --git a/cmake/toolchains/zig/zigcxx b/cmake/toolchains/zig/zigcxx
+new file mode 100755
+index 0000000..35434bd
+--- /dev/null
++++ b/cmake/toolchains/zig/zigcxx
+@@ -0,0 +1,23 @@
++#!/bin/sh
++# `zig c++` for cross builds (macOS from Linux). Target from ZIG_TARGET, e.g. aarch64-macos.11.0.
++# Drops Apple-toolchain flags zig does not understand; the target already implies them.
++ZIG=${ZIG:-$(command -v zig || python3 -c "import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),'zig'))")}
++args=""
++skip=""
++for a in "$@"; do
++  if [ -n "$skip" ]; then skip=""; continue; fi
++  case "$a" in
++    -arch|-isysroot) skip=1 ;;
++    -mmacosx-version-min=*|--target=*|-target=*) ;;
++    *) args="$args '$(printf %s "$a" | sed "s/'/'\\\\''/g")'" ;;
++  esac
++done
++# Target: ZIG_TARGET, else from the wrapper name (zigcc-aarch64-macos -> aarch64-macos.11.0).
++if [ -z "$ZIG_TARGET" ]; then
++  case "$(basename "$0")" in
++    *-aarch64-macos) ZIG_TARGET=aarch64-macos.11.0 ;;
++    *-x86_64-macos)  ZIG_TARGET=x86_64-macos.11.0 ;;
++    *) echo "$0: set ZIG_TARGET" >&2; exit 1 ;;
++  esac
++fi
++eval exec "$ZIG" c++ -target "$ZIG_TARGET" $args
+diff --git a/cmake/toolchains/zig/zigcxx-aarch64-macos b/cmake/toolchains/zig/zigcxx-aarch64-macos
+new file mode 120000
+index 0000000..caf08a7
+--- /dev/null
++++ b/cmake/toolchains/zig/zigcxx-aarch64-macos
+@@ -0,0 +1 @@
++zigcxx
+\ No newline at end of file
+diff --git a/cmake/toolchains/zig/zigcxx-x86_64-macos b/cmake/toolchains/zig/zigcxx-x86_64-macos
+new file mode 120000
+index 0000000..caf08a7
+--- /dev/null
++++ b/cmake/toolchains/zig/zigcxx-x86_64-macos
+@@ -0,0 +1 @@
++zigcxx
+\ No newline at end of file
+diff --git a/cmake/toolchains/zig/zigranlib b/cmake/toolchains/zig/zigranlib
+new file mode 100755
+index 0000000..95fa53a
+--- /dev/null
++++ b/cmake/toolchains/zig/zigranlib
+@@ -0,0 +1,3 @@
++#!/bin/sh
++ZIG=${ZIG:-$(command -v zig || python3 -c "import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),'zig'))")}
++exec "$ZIG" ranlib "$@"
+diff --git a/scripts/capi/build-macos.sh b/scripts/capi/build-macos.sh
+new file mode 100755
+index 0000000..bde7146
+--- /dev/null
++++ b/scripts/capi/build-macos.sh
+@@ -0,0 +1,97 @@
++#!/usr/bin/env bash
++# Cross-build liblaya.dylib for macOS 11+ from Linux with Zig (no Apple SDK needed):
++#   build-mac-arm64/bin/liblaya.dylib          Apple Silicon (M1 baseline: NEON, fp16, dotprod)
++#   build-mac-x86_64-avx2/bin/liblaya.dylib    Intel Macs with AVX2 (2013+ except Mac Pro 2013)
++#   build-mac-x86_64-compat/bin/liblaya.dylib  any Intel Mac that runs macOS 11 (SSE4.2), and Rosetta
++# CPU backend only: Metal/Accelerate/CoreML need Apple frameworks, which a cross build lacks.
++#
++#   pip install ziglang    (or put zig >= 0.13 on PATH; set ZIG=/path/to/zig)
++#   apt install lld        (ld64.lld, for the final link with an exact export list)
++#   scripts/capi/build-macos.sh [arm64] [x86_64-avx2] [x86_64-compat]
++#
++# On a real Mac you would instead use Xcode's clang: cmake -DLAYA_C_API=ON ... (see capi/README.md).
++set -euo pipefail
++ROOT=$(cd "$(dirname "$0")/../.." && pwd)
++WORK=${WORK:-$ROOT/build-deps}
++JOBS=${JOBS:-$(nproc)}
++VERSION=${LAYA_C_VERSION:-1.0.5}
++ICU_VERSION=${ICU_VERSION:-76-1}
++ICU_TGZ=icu4c-${ICU_VERSION/-/_}-src.tgz
++if [ -z "${ZIG:-}" ]; then
++  ZIG=$(command -v zig || python3 -c "import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),'zig'))")
++fi
++export ZIG
++LD64=${LD64_LLD:-$(command -v ld64.lld || command -v ld64.lld-18 || true)}
++W=$ROOT/cmake/toolchains/zig
++VARIANTS=${*:-arm64 x86_64-avx2 x86_64-compat}
++mkdir -p "$WORK" && cd "$WORK"
++
++# 1. Static ICU per architecture (cross builds reuse a native ICU build for the data tools).
++icu_for() {  # $1 = aarch64|x86_64
++  local a=$1 p=$WORK/icu-mac-$1
++  [ -f "$p/lib/libicuuc.a" ] && return
++  [ -f "$ICU_TGZ" ] || curl -fsSL -o "$ICU_TGZ" "https://github.com/unicode-org/icu/releases/download/release-$ICU_VERSION/$ICU_TGZ"
++  [ -d icu ] || tar xzf "$ICU_TGZ"
++  if [ ! -d icu-host/lib ]; then
++    mkdir -p icu-host && (cd icu-host && ../icu/source/runConfigureICU Linux --disable-tests --disable-samples --disable-extras >/dev/null && make -j"$JOBS" >/dev/null)
++  fi
++  rm -rf "icu-mac-$a-build" && mkdir "icu-mac-$a-build"
++  (cd "icu-mac-$a-build" && ZIG_TARGET=$a-macos.11.0 CC=$W/zigcc CXX=$W/zigcxx AR=$W/zigar RANLIB=$W/zigranlib \
++     CFLAGS="-O2 -I$W/macos-stubs" CXXFLAGS="-O2 -std=c++17 -I$W/macos-stubs" \
++     ../icu/source/configure --host=$a-apple-darwin --with-cross-build="$WORK/icu-host" \
++       --enable-static --disable-shared --with-data-packaging=static --disable-tests --disable-samples \
++       --disable-extras --disable-tools --disable-dyload --prefix="$p" >/dev/null &&
++   ZIG_TARGET=$a-macos.11.0 make -j"$JOBS" >/dev/null && (ZIG_TARGET=$a-macos.11.0 make install >/dev/null 2>&1 || true))
++  [ -f "$p/lib/libicudata.a" ] || cp "icu-mac-$a-build/lib/libicudata.a" "$p/lib/"
++}
++
++# Header-only nlohmann-json, isolated from the build machine's /usr/include.
++if [ ! -d nl/include/nlohmann ]; then
++  mkdir -p nl/share/cmake nl/include
++  cp -r /usr/share/cmake/nlohmann_json nl/share/cmake/ && cp -r /usr/include/nlohmann nl/include/
++fi
++
++for variant in $VARIANTS; do
++  case $variant in
++    arm64)         arch=arm64;  za=aarch64; isa=(-DCMAKE_C_FLAGS=-mcpu=apple_m1 "-DCMAKE_CXX_FLAGS=-mcpu=apple_m1 -DU_STATIC_IMPLEMENTATION") ;;
++    x86_64-avx2)   arch=x86_64; za=x86_64;  isa=(-DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON "-DCMAKE_CXX_FLAGS=-DU_STATIC_IMPLEMENTATION") ;;
++    x86_64-compat) arch=x86_64; za=x86_64;  isa=(-DGGML_SSE42=ON -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF "-DCMAKE_CXX_FLAGS=-DU_STATIC_IMPLEMENTATION") ;;
++    *) echo "unknown variant $variant" >&2; exit 1 ;;
++  esac
++  icu_for $za
++  I=$WORK/icu-mac-$za
++  B=$ROOT/build-mac-$variant
++  cmake -S "$ROOT" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
++    -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/toolchains/zig-macos.cmake" -DLAYA_MACOS_ARCH=$arch \
++    -DLAYA_CUDA=OFF -DLAYA_C_API=ON -DBUILD_SHARED_LIBS=OFF -DLAYA_C_VERSION="$VERSION" \
++    -DGGML_NATIVE=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF -DGGML_ACCELERATE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF \
++    "${isa[@]}" \
++    -DICU_ROOT="$I" -DICU_INCLUDE_DIR="$I/include" -DICU_UC_LIBRARY_RELEASE="$I/lib/libicuuc.a" \
++    -DICU_I18N_LIBRARY_RELEASE="$I/lib/libicui18n.a" -DICU_DATA_LIBRARY_RELEASE="$I/lib/libicudata.a" \
++    -Dnlohmann_json_DIR="$WORK/nl/share/cmake/nlohmann_json"
++  cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi
++
++  # zig's Mach-O linker ignores -exported_symbols_list, so relink the dylib with LLVM's ld64.lld
++  # against the same libc++/compiler-rt that zig uses (found by letting zig link a probe).
++  if [ -n "$LD64" ]; then
++    probe=$B/zig-probe; mkdir -p "$probe"
++    printf '#include <string>\nextern "C" int f(){ return (int)std::string("x").size(); }\n' > "$probe/p.cpp"
++    rt=$(cd "$probe" && ZIG_VERBOSE_LINK=1 "$W/zigcxx-$za-macos" -O3 -dynamiclib -o p.dylib p.cpp 2>&1 |
++         tr ' ' '\n' | grep -E '/lib(c\+\+abi|c\+\+|compiler_rt)\.a$' | tr '\n' ' ')
++    libdir=$("$ZIG" env | sed -n 's/.*\.lib_dir = "\(.*\)".*/\1/p')
++    ldarch=$([ $za = aarch64 ] && echo arm64 || echo x86_64)
++    inputs=$(sed -n 's/^  LINK_LIBRARIES = //p' <(sed -n '/^build bin\/liblaya.dylib/,/^$/p' "$B/build.ninja") | sed 's/ -lm//')
++    (cd "$B" && "$LD64" -arch $ldarch -platform_version macos 11.0 11.0 -dylib -o bin/liblaya.dylib \
++       -install_name @rpath/liblaya.dylib -compatibility_version 1.0.0 -current_version 1.0.0 \
++       -exported_symbols_list "$ROOT/capi/macos-exports.txt" -dead_strip -x -adhoc_codesign \
++       capi/CMakeFiles/laya_c.dir/laya_c.cpp.o $inputs $rt -L"$libdir/libc/darwin" -lSystem)
++    # Relink the test program the same way, so it is ad-hoc signed on Intel too (zig signs arm64 only).
++    crt=$(printf '%s\n' $rt | grep compiler_rt || true)
++    (cd "$B" && "$LD64" -arch $ldarch -platform_version macos 11.0 11.0 -execute -o bin/test-capi \
++       -rpath @executable_path -dead_strip -adhoc_codesign \
++       capi/CMakeFiles/test-capi.dir/__/tests/capi/test_capi.c.o bin/liblaya.dylib $crt -L"$libdir/libc/darwin" -lSystem)
++  else
++    echo "warning: ld64.lld not found; $variant dylib exports internal symbols too" >&2
++  fi
++  echo "== $variant: $B/bin/liblaya.dylib"
++done
+diff --git a/tests/capi/test_capi.c b/tests/capi/test_capi.c
+index 145040b..8b03031 100644
+--- a/tests/capi/test_capi.c
++++ b/tests/capi/test_capi.c
+@@ -44,6 +44,19 @@ static void unmask_fp_exceptions(void) {
+     unsigned int cw;
+     _controlfp_s(&cw, 0, 0);
+     _controlfp_s(&cw, cw & ~(unsigned)(_EM_INVALID | _EM_ZERODIVIDE | _EM_OVERFLOW), _MCW_EM);
++#elif defined(__APPLE__) && defined(__x86_64__)
++    /* macOS has no feenableexcept: clear the masks in both control registers directly. */
++    unsigned short cw;
++    unsigned csr;
++    __asm__ volatile("fnstcw %0" : "=m"(cw));
++    cw &= (unsigned short)~(0x01 | 0x04 | 0x08); /* invalid, divide by zero, overflow */
++    __asm__ volatile("fnclex; fldcw %0" : : "m"(cw));
++    __asm__ volatile("stmxcsr %0" : "=m"(csr));
++    csr &= ~(0x0080u | 0x0200u | 0x0400u);        /* IM, ZM, OM */
++    csr &= ~0x3Fu;
++    __asm__ volatile("ldmxcsr %0" : : "m"(csr));
++#elif defined(__APPLE__)
++    /* Apple Silicon does not implement floating-point exception traps; nothing to unmask. */
+ #else
+     feenableexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+ #endif
+@@ -68,6 +81,12 @@ static unsigned fp_exception_state(void) {
+     unsigned int cw;
+     _controlfp_s(&cw, 0, 0);
+     return cw & _MCW_EM;
++#elif defined(__APPLE__) && defined(__aarch64__)
++    unsigned long long fpcr;
++    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
++    return (unsigned)fpcr;
++#elif defined(__APPLE__)
++    return sse_control();
+ #else
+     return (unsigned)fegetexcept();
+ #endif
+-- 
+2.43.0
+

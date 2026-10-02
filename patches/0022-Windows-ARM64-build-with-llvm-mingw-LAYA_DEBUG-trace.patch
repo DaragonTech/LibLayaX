@@ -1,0 +1,581 @@
+From 074c3c3dee3014a8fb1150031aef50d738167682 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 2 Oct 2026 00:18:23 +0100
+Subject: [PATCH 22/30] Windows ARM64: build with llvm-mingw; LAYA_DEBUG trace;
+ laya-probe; live run-tests.bat
+
+The Zig-built ARM64 DLL hung on real Windows on ARM in the first call that throws
+inside the library (cause not identified; the same code passes under ARM64 Wine).
+- scripts/capi/build-arm64.sh: Windows target now uses llvm-mingw (LLVM_MINGW=...)
+- cmake/toolchains/llvm-mingw-aarch64.cmake
+- LAYA_DEBUG=1: entry-point and model-load progress on stderr
+- tests/capi/probe.cpp: stand-alone C++ runtime probe (laya-probe)
+- run-tests.bat prints live instead of collecting a log file
+- test-capi announces the contract steps and the model load
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt                       | 11 +++-
+ capi/laya_c.cpp                           | 27 +++++++++
+ cmake/toolchains/llvm-mingw-aarch64.cmake | 26 +++++++++
+ scripts/capi/build-arm64.sh               | 27 ++++++---
+ scripts/capi/run-tests.bat                | 69 ++++++++++++-----------
+ src/runtime.cpp                           | 21 +++++++
+ tests/capi/probe.cpp                      | 66 ++++++++++++++++++++++
+ tests/capi/test_capi.c                    |  5 ++
+ 8 files changed, 210 insertions(+), 42 deletions(-)
+ create mode 100644 cmake/toolchains/llvm-mingw-aarch64.cmake
+ create mode 100644 tests/capi/probe.cpp
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index c5d34df..e065705 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ # Flat C ABI shared library over laya.cpp: laya.dll (Windows), liblaya.so (Linux), liblaya.dylib (macOS).
+ # Enable from the top level with -DLAYA_C_API=ON. Build ggml statically (-DBUILD_SHARED_LIBS=OFF)
+ # to get a single self-contained library.
+-set(LAYA_C_VERSION "1.0.9" CACHE STRING "Version string reported by laya_version()")
++set(LAYA_C_VERSION "1.0.11" CACHE STRING "Version string reported by laya_version()")
+ 
+ add_library(laya_c SHARED laya_c.cpp)
+ target_include_directories(laya_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+@@ -76,6 +76,15 @@ if(BUILD_TESTING)
+   elseif(APPLE)
+     set_target_properties(laya-bench PROPERTIES BUILD_RPATH "@executable_path")
+   endif()
++  # Stand-alone check of the C++ runtime features the library relies on (no laya.dll, no model).
++  add_executable(laya-probe ${CMAKE_SOURCE_DIR}/tests/capi/probe.cpp)
++  set_target_properties(laya-probe PROPERTIES CXX_STANDARD 20 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
++  if(LAYA_MINGW_GCC)
++    target_link_options(laya-probe PRIVATE -static)
++  elseif(UNIX AND NOT APPLE)
++    find_package(Threads REQUIRED)
++    target_link_libraries(laya-probe PRIVATE Threads::Threads)
++  endif()
+   add_executable(laya-diag ${CMAKE_SOURCE_DIR}/tests/capi/diag_capi.c)
+   set_target_properties(laya-diag PROPERTIES C_STANDARD 11 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+   target_link_libraries(laya-diag PRIVATE laya_c)
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index 8dd223e..024fdf9 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -136,6 +136,18 @@ struct call_guard {
+     ~call_guard() { --calls_in_progress; }
+ };
+ 
++// Diagnostics: with LAYA_DEBUG=1 in the environment every entry point reports its progress on
++// stderr ("[laya] ..."), flushed line by line, so a hang or a crash can be located from outside.
++bool debug_enabled() {
++    static const bool enabled = [] { const char* flag = std::getenv("LAYA_DEBUG"); return flag && *flag && *flag != '0'; }();
++    return enabled;
++}
++void debug(const char* text, const char* detail = nullptr) {
++    if (!debug_enabled()) return;
++    std::fprintf(stderr, detail ? "[laya] %s: %s\n" : "[laya] %s\n", text, detail);
++    std::fflush(stderr);
++}
++
+ // Logging: one process-wide sink shared by the library and ggml.
+ std::mutex log_lock;
+ laya_log_fn log_fn = nullptr;
+@@ -330,9 +342,13 @@ LAYA_API void LAYA_CALL laya_set_log_callback(laya_log_fn fn, void* user, int mi
+ }
+ 
+ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* options_json) {
++    debug("create: enter");
+     call_guard fp;
++    debug("create: floating-point guard set");
+     clear_last_error();
++    debug("create: thread-local error text cleared");
+     install_hooks();
++    debug("create: checking arguments");
+     try {
+         if (!model_dir || !*model_dir) throw std::invalid_argument("model_dir is empty");
+         const auto options = options_json && *options_json ? laya::json::parse(options_json) : laya::json::object();
+@@ -407,12 +423,14 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+                                      "does not provide: " + missing + ". Use a build for an older CPU baseline.");
+         static std::mutex create_lock;  // set_cpu_threads is process-wide; keep creation atomic
+         std::lock_guard<std::mutex> guard(create_lock);
++        debug("create: loading model", path_utf8(directory).c_str());
+         laya::set_cpu_threads(threads ? threads : int(std::max(1u, std::thread::hardware_concurrency())));
+         laya::set_gpu_device(device);
+         auto* agent = new laya_agent{laya::agent(directory, backend, precision, flash, tensor_core, allow_truncation),
+                                      {}, path_utf8(directory), {}, {}};
+         laya::set_cpu_threads(0);
+         laya::set_gpu_device("");
++        debug("create: model loaded");
+ 
+         std::ifstream config_file(directory / "rl_agent_config.json");
+         const auto config = laya::json::parse(config_file, nullptr, false);
+@@ -423,8 +441,10 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+             agent->variant = agent->model_name == "laya-typed-decisions" ? "typed-decisions" :
+                              config.value("encoder", "") == "jhu-clsp/mmBERT-base" ? "multilingual" : "english";
+         }
++        debug("create: done");
+         return agent;
+     } catch (const std::exception& e) {
++        debug("create: failed", e.what());
+         laya::set_cpu_threads(0);
+         laya::set_gpu_device("");
+         set_last_error(describe(e));
+@@ -433,18 +453,22 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+         laya::set_gpu_device("");
+         set_last_error("Unknown failure while loading the model");
+     }
++    debug("create: returning NULL");
+     return nullptr;
+ }
+ 
+ LAYA_API char* LAYA_CALL laya_predict(laya_agent* agent, const char* request_json) {
++    debug("predict: enter");
+     call_guard fp;
+     clear_last_error();
+     try {
+         if (!agent) throw std::invalid_argument("agent is NULL");
+         auto requests = parse_requests(request_json);
+         std::lock_guard<std::mutex> guard(agent->lock);  // direct calls on one agent must be serialized
++        debug("predict: running the model");
+         const auto start = std::chrono::steady_clock::now();
+         auto results = agent->impl.predict(requests);
++        debug("predict: done");
+         const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+         return copy(laya::json{{"results", results}, {"elapsed_ms", elapsed}, {"backend", agent->impl.backend_name()},
+                                {"device", agent->impl.device_name()}}
+@@ -452,6 +476,7 @@ LAYA_API char* LAYA_CALL laya_predict(laya_agent* agent, const char* request_jso
+     } catch (const std::bad_alloc&) {
+         return error_json("Out of memory");
+     } catch (const std::exception& e) {
++        debug("predict: failed", e.what());
+         return error_json(describe(e));
+     } catch (...) {
+         return error_json("Unknown failure during prediction");
+@@ -491,8 +516,10 @@ LAYA_API char* LAYA_CALL laya_info(laya_agent* agent) {
+ LAYA_API void LAYA_CALL laya_free_string(char* text) { std::free(text); }
+ 
+ LAYA_API void LAYA_CALL laya_destroy(laya_agent* agent) {
++    debug("destroy: enter");
+     call_guard fp;
+     try { delete agent; } catch (...) {}
++    debug("destroy: done");
+ }
+ 
+ LAYA_API const char* LAYA_CALL laya_last_error(void) { return last_error_text; }
+diff --git a/cmake/toolchains/llvm-mingw-aarch64.cmake b/cmake/toolchains/llvm-mingw-aarch64.cmake
+new file mode 100644
+index 0000000..3b80b2b
+--- /dev/null
++++ b/cmake/toolchains/llvm-mingw-aarch64.cmake
+@@ -0,0 +1,26 @@
++# Cross-compile native Windows ARM64 binaries with llvm-mingw (https://github.com/mstorsjo/llvm-mingw),
++# the clang/lld/libc++ MinGW toolchain that is tested on real Windows-on-ARM machines.
++#   cmake -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/llvm-mingw-aarch64.cmake -DLLVM_MINGW=/path/to/llvm-mingw ...
++# (or put llvm-mingw's bin directory on PATH). -static folds libc++ and libunwind into each binary,
++# leaving only Windows system DLLs (kernel32, the Universal CRT) as dependencies.
++if(NOT LLVM_MINGW AND DEFINED ENV{LLVM_MINGW})
++  set(LLVM_MINGW "$ENV{LLVM_MINGW}")
++endif()
++set(LLVM_MINGW "${LLVM_MINGW}" CACHE PATH "llvm-mingw installation directory")
++list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES LLVM_MINGW)
++if(LLVM_MINGW)
++  set(_llvm_mingw_bin "${LLVM_MINGW}/bin/")
++endif()
++set(CMAKE_SYSTEM_NAME Windows)
++set(CMAKE_SYSTEM_PROCESSOR ARM64)
++set(CMAKE_C_COMPILER   ${_llvm_mingw_bin}aarch64-w64-mingw32-clang)
++set(CMAKE_CXX_COMPILER ${_llvm_mingw_bin}aarch64-w64-mingw32-clang++)
++set(CMAKE_RC_COMPILER  ${_llvm_mingw_bin}aarch64-w64-mingw32-windres)
++# Windows on ARM starts at Windows 10 (cpp-httplib requires its API level).
++add_compile_definitions(_WIN32_WINNT=0x0A00)
++set(CMAKE_SHARED_LINKER_FLAGS_INIT "-static")
++set(CMAKE_EXE_LINKER_FLAGS_INIT "-static")
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
++set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+diff --git a/scripts/capi/build-arm64.sh b/scripts/capi/build-arm64.sh
+index 8abb217..9635b95 100755
+--- a/scripts/capi/build-arm64.sh
++++ b/scripts/capi/build-arm64.sh
+@@ -1,8 +1,13 @@
+ #!/usr/bin/env bash
+-# Cross-build the ARM64 libraries from Linux with Zig (pip install ziglang; no other toolchain):
+-#   build-linux-arm64/bin/liblaya.so   Linux aarch64, glibc >= 2.27, ARMv8.0 + NEON baseline
++# Cross-build the ARM64 libraries from Linux:
++#   build-linux-arm64/bin/liblaya.so   Linux aarch64, glibc >= 2.27, ARMv8.0 + NEON baseline.
++#                                      Built with Zig (pip install ziglang).
+ #   build-win-arm64/bin/laya.dll       native Windows ARM64 (for ARM64 processes; an x64 process
+-#                                      running under emulation needs the x64 compat DLL instead)
++#                                      running under emulation needs the x64 compat DLL instead).
++#                                      Built with llvm-mingw (https://github.com/mstorsjo/llvm-mingw;
++#                                      set LLVM_MINGW to the unpacked directory). Do not build this
++#                                      one with Zig 0.16: the result hangs on real Windows on ARM
++#                                      the first time the library throws a C++ exception.
+ # CPU backend. libc++ and ICU are linked in.
+ #
+ #   scripts/capi/build-arm64.sh [linux] [windows]
+@@ -14,7 +19,7 @@ set -euo pipefail
+ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ WORK=${WORK:-$ROOT/build-deps}
+ JOBS=${JOBS:-$(nproc)}
+-VERSION=${LAYA_C_VERSION:-1.0.9}
++VERSION=${LAYA_C_VERSION:-1.0.11}
+ ICU_VERSION=${ICU_VERSION:-76-1}
+ ICU_TGZ=icu4c-${ICU_VERSION/-/_}-src.tgz
+ W=$ROOT/cmake/toolchains/zig
+@@ -33,17 +38,21 @@ fi
+ 
+ for target in $TARGETS; do
+   case $target in
+-    linux)   zt=aarch64-linux;   host=aarch64-linux-gnu;   prefix=$WORK/icu-linux-arm64; flags="-O2 -fPIC"
++    linux)   host=aarch64-linux-gnu;   prefix=$WORK/icu-linux-arm64; flags="-O2 -fPIC"
++             cc=$W/zigcc-aarch64-linux; cxx=$W/zigcxx-aarch64-linux; ar=$W/zigar; ranlib=$W/zigranlib
+              B=$ROOT/build-linux-arm64; toolchain=zig-linux-aarch64.cmake; tools="laya-trace"
+              uc=libicuuc.a; in=libicui18n.a; dt=libicudata.a ;;
+-    windows) zt=aarch64-windows; host=aarch64-w64-mingw32; prefix=$WORK/icu-win-arm64;   flags="-O2"
+-             B=$ROOT/build-win-arm64;   toolchain=zig-windows-aarch64.cmake; tools=""
++    windows) host=aarch64-w64-mingw32; prefix=$WORK/icu-win-arm64-llvm; flags="-O2"
++             M=${LLVM_MINGW:?set LLVM_MINGW to the llvm-mingw directory}/bin; export LLVM_MINGW
++             cc=$M/aarch64-w64-mingw32-clang; cxx=$M/aarch64-w64-mingw32-clang++
++             ar=$M/aarch64-w64-mingw32-ar; ranlib=$M/aarch64-w64-mingw32-ranlib
++             B=$ROOT/build-win-arm64;   toolchain=llvm-mingw-aarch64.cmake; tools=""
+              uc=libsicuuc.a; in=libsicuin.a; dt=libsicudt.a ;;
+     *) echo "unknown target $target" >&2; exit 1 ;;
+   esac
+   if [ ! -f "$prefix/lib/$uc" ]; then
+     rm -rf "$prefix-build" && mkdir "$prefix-build"
+-    (cd "$prefix-build" && CC=$W/zigcc-$zt CXX=$W/zigcxx-$zt AR=$W/zigar RANLIB=$W/zigranlib CFLAGS="$flags" CXXFLAGS="$flags -std=c++17" \
++    (cd "$prefix-build" && CC=$cc CXX=$cxx AR=$ar RANLIB=$ranlib CFLAGS="$flags" CXXFLAGS="$flags -std=c++17" \
+        ../icu/source/configure --host=$host --with-cross-build="$WORK/icu-host" --enable-static --disable-shared \
+          --with-data-packaging=static --disable-tests --disable-samples --disable-extras --disable-tools --disable-dyload \
+          --prefix="$prefix" >/dev/null && make -j"$JOBS" >/dev/null && (make install >/dev/null 2>&1 || true))
+@@ -57,7 +66,7 @@ for target in $TARGETS; do
+     -DICU_ROOT="$prefix" -DICU_INCLUDE_DIR="$prefix/include" -DICU_UC_LIBRARY_RELEASE="$prefix/lib/$uc" \
+     -DICU_I18N_LIBRARY_RELEASE="$prefix/lib/$in" -DICU_DATA_LIBRARY_RELEASE="$prefix/lib/$dt" \
+     -DCMAKE_CXX_FLAGS=-DU_STATIC_IMPLEMENTATION -Dnlohmann_json_DIR="$WORK/nl/share/cmake/nlohmann_json"
+-  cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi laya-cli laya-bench laya-diag $tools
++  cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi laya-cli laya-bench laya-diag laya-probe $tools
+   echo "== $target arm64: $B/bin"
+   if [ $target = linux ] && [ "${RUN_TESTS:-0}" = 1 ]; then
+     (cd "$B/bin" && LAYA_TEST_QUICK=1 qemu-aarch64-static -L /usr/aarch64-linux-gnu -E LD_LIBRARY_PATH=. ./test-capi) || [ $? = 77 ]
+diff --git a/scripts/capi/run-tests.bat b/scripts/capi/run-tests.bat
+index b4155c6..a279e25 100644
+--- a/scripts/capi/run-tests.bat
++++ b/scripts/capi/run-tests.bat
+@@ -1,8 +1,9 @@
+ @echo off
+-rem laya.dll 1.0.9 - confirmation run. Put this file next to laya.dll and run:
++rem laya.dll - confirmation run. Put this file next to laya.dll and run:
+ rem     run-tests.bat MODEL_FOLDER [cpu^|vulkan]
+ rem Example: run-tests.bat E:\Garbage\!laya\convaiinnovations@laya
+-rem Results are shown and saved to laya-test-log.txt in this folder.
++rem Everything is printed as it happens. To keep a copy:  run-tests.bat MODEL > log.txt 2>&1
++rem Set LAYA_DEBUG=1 beforehand to see what the library is doing inside each call.
+ setlocal DisableDelayedExpansion
+ cd /d "%~dp0"
+ 
+@@ -24,62 +25,66 @@ if not exist "%MODEL%\rl_agent_config.json" (
+   exit /b 2
+ )
+ 
+-set "LOG=%CD%\laya-test-log.txt"
+ set LAYA_CRASH_REPORT=1
+-set "LAYA_TEST_MODEL=%MODEL%"
+ set "LAYA_TEST_BACKEND=%BACKEND%"
+ set FAILED=0
++if exist laya-crash.txt del laya-crash.txt
+ 
+-> "%LOG%" echo laya.dll confirmation run, backend %BACKEND%
+->> "%LOG%" echo model: %MODEL%
+->> "%LOG%" echo.
++echo laya.dll confirmation run, backend %BACKEND%
++echo model: %MODEL%
++echo.
+ 
+-echo [1/3] C test suite ...
+->> "%LOG%" echo ===== 1. test-capi.exe =====
+-test-capi.exe >> "%LOG%" 2>&1
++set RC0=skipped
++if not exist laya-probe.exe goto :suite
++echo ===== 1. laya-probe.exe (C++ runtime, a few seconds) =====
++laya-probe.exe
++set RC0=%ERRORLEVEL%
++if not "%RC0%"=="0" set FAILED=1
++echo exit code %RC0%
++echo.
++
++:suite
++echo ===== 2. test-capi.exe (each [step] is printed before it runs) =====
++set "LAYA_TEST_MODEL=%MODEL%"
++test-capi.exe
+ set RC1=%ERRORLEVEL%
+ if not "%RC1%"=="0" set FAILED=1
+->> "%LOG%" echo exit code %RC1%
+->> "%LOG%" echo.
++echo exit code %RC1%
++echo.
+ 
+ set RC2=skipped
+ if not exist LayaTests.exe goto :bench
+-echo [2/3] Pascal binding ...
+->> "%LOG%" echo ===== 2. LayaTests.exe =====
+-LayaTests.exe "%MODEL%" %BACKEND% >> "%LOG%" 2>&1
++echo ===== 3. LayaTests.exe (Pascal binding) =====
++LayaTests.exe "%MODEL%" %BACKEND%
+ set RC2=%ERRORLEVEL%
+ if not "%RC2%"=="0" set FAILED=1
+->> "%LOG%" echo exit code %RC2%
+->> "%LOG%" echo.
++echo exit code %RC2%
++echo.
+ 
+ :bench
+-
+-echo [3/3] Speed ...
+->> "%LOG%" echo ===== 3. laya-bench.exe =====
++echo ===== 4. laya-bench.exe (speed) =====
+ if /i "%BACKEND%"=="cpu" (
+-  laya-bench.exe "%MODEL%" "{\"backend\":\"cpu\"}" >> "%LOG%" 2>&1
++  laya-bench.exe "%MODEL%" "{\"backend\":\"cpu\"}"
+ ) else (
+-  laya-bench.exe "%MODEL%" >> "%LOG%" 2>&1
++  laya-bench.exe "%MODEL%"
+ )
+ set RC3=%ERRORLEVEL%
+ if not "%RC3%"=="0" set FAILED=1
+->> "%LOG%" echo exit code %RC3%
++echo exit code %RC3%
+ 
+ if exist laya-crash.txt (
+-  >> "%LOG%" echo.
+-  >> "%LOG%" echo ===== laya-crash.txt =====
+-  type laya-crash.txt >> "%LOG%"
++  echo.
++  echo ===== laya-crash.txt =====
++  type laya-crash.txt
+   set FAILED=1
+ )
+ 
+-echo.
+-type "%LOG%"
+ echo.
+ echo ------------------------------------------------------------
+ if "%FAILED%"=="0" (
+-  echo RESULT: ALL PASSED   ^(test-capi %RC1%, LayaTests %RC2%, laya-bench %RC3%^)
++  echo RESULT: ALL PASSED   ^(probe %RC0%, test-capi %RC1%, LayaTests %RC2%, laya-bench %RC3%^)
+ ) else (
+-  echo RESULT: SOMETHING FAILED   ^(test-capi %RC1%, LayaTests %RC2%, laya-bench %RC3%^)
++  echo RESULT: SOMETHING FAILED   ^(probe %RC0%, test-capi %RC1%, LayaTests %RC2%, laya-bench %RC3%^)
++  echo Please send everything printed above.
+ )
+-echo Log saved to %LOG%
+-endlocal & exit /b %FAILED%
++if "%FAILED%"=="0" (exit /b 0) else (exit /b 1)
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index 6fc0373..4dd343b 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -26,6 +26,7 @@ const char* laya_cuda_bf16_compatibility_error();
+ #include <mutex>
+ #include <chrono>
+ #include <cmath>
++#include <cstdio>
+ #include <cstring>
+ #include <cstdlib>
+ #include <fstream>
+@@ -34,6 +35,13 @@ const char* laya_cuda_bf16_compatibility_error();
+ #include <set>
+ #include <stdexcept>
+ 
++// LAYA_DEBUG=1: progress lines on stderr (same switch as the C API's entry-point trace).
++static void load_trace(const std::string& text) {
++    static const bool enabled = [] { const char* flag = std::getenv("LAYA_DEBUG"); return flag && *flag && *flag != '0'; }();
++    if (!enabled) return;
++    std::fprintf(stderr, "[laya] load: %s\n", text.c_str());
++    std::fflush(stderr);
++}
+ namespace laya {
+ namespace { std::atomic<int> cpu_thread_count{0}; }
+ void set_cpu_threads(int count) { cpu_thread_count = count > 0 ? count : 0; }
+@@ -105,8 +113,11 @@ struct runtime::impl {
+             setenv("NVIDIA_TF32_OVERRIDE", "0", 1) != 0)
+ #endif
+             throw std::runtime_error("Cannot enforce FP32 CUDA arithmetic");
++        load_trace("reading rl_agent_config.json");
+         config = read_json(directory / "rl_agent_config.json");
++        load_trace("reading encoder/config.json");
+         encoder = read_json(directory / "encoder/config.json");
++        load_trace("configuration read");
+         width=encoder.at("hidden_size"); heads=encoder.at("num_attention_heads");
+         layers=encoder.at("num_hidden_layers"); intermediate=encoder.at("intermediate_size");
+         vocabulary=encoder.at("vocab_size");
+@@ -185,17 +196,21 @@ struct runtime::impl {
+         if (vulkan) throw std::runtime_error("This build has no Vulkan backend");
+ #endif
+         if (selected == backend_type::cpu) {
++            load_trace("starting the cpu backend, threads=" + std::to_string(cpu_threads()));
+             backend = ggml_backend_cpu_init();
+             if (backend && cpu_threads() > 0) ggml_backend_cpu_set_n_threads(backend, cpu_threads());
+         }
+         if (!backend) throw std::runtime_error("Cannot initialize requested backend");
++        load_trace("backend started, asking for its device name");
+         const std::string device=ggml_backend_dev_description(ggml_backend_get_device(backend));
++        load_trace("device: " + device);
+         vulkan_nvidia=vulkan && device.find("NVIDIA")!=std::string::npos;
+         vulkan_amd=vulkan && device.find("AMD")!=std::string::npos;
+ 
+         std::ifstream file(directory / "model.safetensors", std::ios::binary | std::ios::ate);
+         if (!file) throw std::runtime_error("Cannot open model.safetensors");
+         auto file_size = uint64_t(file.tellg());
++        load_trace("model.safetensors opened, " + std::to_string(file_size / (1024 * 1024)) + " MB");
+         file.seekg(0);
+         uint64_t header_size = 0;
+         file.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
+@@ -203,6 +218,7 @@ struct runtime::impl {
+             throw std::runtime_error("Invalid safetensors header size");
+         std::string header(header_size, '\0'); file.read(header.data(), header.size());
+         auto entries = json::parse(header);
++        load_trace("header parsed, " + std::to_string(entries.size()) + " entries");
+         std::set<std::string> required;
+         auto expect = [&](const std::string& name, std::initializer_list<int64_t> shape) {
+             required.insert(name);
+@@ -255,7 +271,10 @@ struct runtime::impl {
+         }
+         tensor* gelu_table=nullptr;
+         if (vulkan && low_precision) gelu_table=ggml_new_tensor_1d(weight_context,GGML_TYPE_F32,65536);
++        load_trace("allocating memory for the weights");
+         weight_buffer = ggml_backend_alloc_ctx_tensors(weight_context, backend);
++        load_trace("reading " + std::to_string(weights.size()) + " tensors");
++        size_t tensor_index = 0;
+         if (!weight_buffer) throw std::runtime_error("Insufficient device memory for model weights");
+         ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+         for (auto& [name, tensor] : weights) {
+@@ -267,6 +286,7 @@ struct runtime::impl {
+             if (offsets.size() != 2 || !stride || offsets[1] < offsets[0] || offsets[1] > file_size - 8 - header_size ||
+                 offsets[1] - offsets[0] != uint64_t(count) * stride)
+                 throw std::runtime_error("Invalid safetensors payload: " + name);
++            load_trace("tensor " + std::to_string(++tensor_index) + "/" + std::to_string(weights.size()) + " " + name);
+             std::vector<char> bytes(count * stride);
+             file.seekg(8 + header_size + offsets[0]); file.read(bytes.data(), bytes.size());
+             if (!file) throw std::runtime_error("Truncated tensor payload: " + name);
+@@ -306,6 +326,7 @@ struct runtime::impl {
+             ggml_backend_tensor_set(gelu_table,values.data(),0,ggml_nbytes(gelu_table));
+             weights["laya.gelu_table"]=gelu_table;
+         }
++        load_trace("weights ready; loading the tokenizer next");
+     }
+ 
+     tensor* w(const std::string& name) { return weights.at(name); }
+diff --git a/tests/capi/probe.cpp b/tests/capi/probe.cpp
+new file mode 100644
+index 0000000..e33c5f5
+--- /dev/null
++++ b/tests/capi/probe.cpp
+@@ -0,0 +1,66 @@
++// laya-probe: checks, one step at a time, the C++ runtime features laya.dll depends on (atomics,
++// thread-local storage, floating-point environment, call_once, mutexes, exceptions, threads).
++// It does not use laya.dll. Every step is announced before it runs, so if the program stops,
++// the last line shows which feature is broken on this machine.
++#include <atomic>
++#include <cfenv>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++
++static int step_number = 0;
++static void step(const char* name) { std::printf("%2d %s ... ", ++step_number, name); std::fflush(stdout); }
++static void ok() { std::printf("ok\n"); std::fflush(stdout); }
++
++static std::atomic<int> counter{0};
++thread_local char thread_text[2048];
++static std::mutex lock;
++
++#if defined(__GNUC__) || defined(__clang__)
++#define NOINLINE __attribute__((noinline))
++#else
++#define NOINLINE __declspec(noinline)
++#endif
++NOINLINE static void thrower(int depth, const std::string& text) {
++    std::string local = text + "!";  // an object with a destructor in every frame (cleanup landing pads)
++    if (depth > 0) thrower(depth - 1, local);
++    else throw std::invalid_argument(local);
++}
++
++int main() {
++    std::printf("laya-probe (%s)\n",
++#if defined(__aarch64__) || defined(_M_ARM64)
++                "arm64"
++#else
++                "x86-64"
++#endif
++    );
++    step("atomic increment"); ++counter; --counter; ok();
++    step("thread-local storage"); std::strcpy(thread_text, "hello"); ok();
++    step("floating-point environment"); { std::fenv_t saved; std::feholdexcept(&saved); std::fesetenv(&saved); } ok();
++    step("call_once"); { static std::once_flag once; std::call_once(once, [] { ++counter; }); } ok();
++    step("mutex"); { std::lock_guard<std::mutex> guard(lock); ++counter; } ok();
++    step("throw int, catch in the same function");
++    try { throw 42; } catch (int) {}
++    ok();
++    step("throw std::exception through 3 frames");
++    try { thrower(3, "x"); } catch (const std::exception& e) { if (std::strcmp(e.what(), "x!!!!") != 0) std::printf("(wrong text) "); }
++    ok();
++    step("100 exceptions in a row");
++    for (int i = 0; i < 100; ++i) { try { thrower(1, "y"); } catch (...) {} }
++    ok();
++    step("4 threads");
++    {
++        std::vector<std::thread> threads;
++        for (int i = 0; i < 4; ++i)
++            threads.emplace_back([] { for (int k = 0; k < 1000; ++k) { ++counter; try { thrower(1, "z"); } catch (...) {} } });
++        for (auto& t : threads) t.join();
++    }
++    ok();
++    std::printf("probe finished: everything works\n");
++    return 0;
++}
+diff --git a/tests/capi/test_capi.c b/tests/capi/test_capi.c
+index 541f99d..b100c4d 100644
+--- a/tests/capi/test_capi.c
++++ b/tests/capi/test_capi.c
+@@ -169,6 +169,8 @@ static void test_contract(void) {
+     CHECK(laya_api_version() == LAYA_C_API_VERSION, "api=%d", laya_api_version());
+     printf("library: %s\n", v);
+ 
++    /* The first call that fails inside the library: it throws and catches a C++ exception. */
++    STEP("contract: errors are reported, not thrown");
+     CHECK(laya_create(NULL, NULL) == NULL, "NULL dir must fail");
+     CHECK(contains(laya_last_error(), "model_dir"), "err=%s", laya_last_error());
+     CHECK(laya_create("", NULL) == NULL, "empty dir must fail");
+@@ -190,6 +192,7 @@ static void test_contract(void) {
+         CHECK(contains(laya_last_error(), bad_options[i][1]), "options %s -> err=%s", bad_options[i][0], laya_last_error());
+     }
+ 
++    STEP("contract: NULL agent");
+     char* r = laya_predict(NULL, "{}");
+     CHECK(is_error(r) && contains(r, "agent is NULL"), "predict(NULL)=%s", r ? r : "(null)");
+     CHECK(contains(laya_last_error(), "agent is NULL"), "err=%s", laya_last_error());
+@@ -211,6 +214,7 @@ static void test_contract(void) {
+ 
+     laya_set_log_callback(count_log, &log_calls, 1);
+     laya_set_log_callback(NULL, NULL, 0);
++    STEP("contract: done");
+ }
+ 
+ /* ---------------------------------------------------------------- model tests */
+@@ -241,6 +245,7 @@ static THREAD_RET worker(void* p) {
+ static void test_model(const char* model, const char* backend, const char* dump_path) {
+     char options[128];
+     snprintf(options, sizeof options, "{\"backend\":\"%s\"}", backend);
++    STEP("loading the model");
+     laya_agent* agent = laya_create(model, options);
+     CHECK(agent != NULL, "create(%s): %s", model, laya_last_error());
+     if (!agent) return;
+-- 
+2.43.0
+

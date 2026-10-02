@@ -1,0 +1,110 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 87a329f..622132d 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3856,15 +3856,27 @@ int ggml_cpu_has_sme2(void) {
+ #endif
+ }
+ 
++// LAYA_DEBUG=1 progress lines (diagnostic patch, see capi/patches/ggml-trace.diff)
++static void laya_ggml_trace(const char * text, int value) {
++    const char * flag = getenv("LAYA_DEBUG");
++    if (!flag || !*flag || *flag == '0') return;
++    fprintf(stderr, "[laya] ggml: %s %d\n", text, value);
++    fflush(stderr);
++}
++
+ void ggml_cpu_init(void) {
++    laya_ggml_trace("cpu_init: enter", 0);
+     // needed to initialize ggml_time
+     {
+         struct ggml_init_params params = { 0, NULL, false };
+         struct ggml_context * ctx = ggml_init(params);
++        laya_ggml_trace("cpu_init: ggml_init returned", ctx != NULL);
+         ggml_free(ctx);
+     }
+ 
++    laya_ggml_trace("cpu_init: taking the lock", 0);
+     ggml_critical_section_start();
++    laya_ggml_trace("cpu_init: lock taken", 0);
+ 
+     static bool is_first_call = true;
+ 
+@@ -3874,6 +3886,7 @@ void ggml_cpu_init(void) {
+             const uint64_t t_start = ggml_time_us(); UNUSED(t_start);
+ 
+             for (int i = 0; i < (1 << 16); ++i) {
++                if ((i & 0xfff) == 0) laya_ggml_trace("cpu_init: half-float tables, entry", i);
+                 union {
+                     uint16_t u16;
+                     ggml_fp16_t fp16;
+@@ -3916,6 +3929,7 @@ void ggml_cpu_init(void) {
+ #endif
+         }
+ 
++        laya_ggml_trace("cpu_init: tables done", 0);
+ #if defined(__ARM_ARCH)
+         ggml_init_arm_arch_features();
+ #endif
+@@ -3933,4 +3947,5 @@ void ggml_cpu_init(void) {
+     }
+ 
+     ggml_critical_section_end();
++    laya_ggml_trace("cpu_init: done", 0);
+ }
+diff --git a/src/ggml-cpu/ggml-cpu.cpp b/src/ggml-cpu/ggml-cpu.cpp
+index 8cece71..8047c3b 100644
+--- a/src/ggml-cpu/ggml-cpu.cpp
++++ b/src/ggml-cpu/ggml-cpu.cpp
+@@ -214,9 +214,18 @@ static ggml_guid_t ggml_backend_cpu_guid(void) {
+     return &guid;
+ }
+ 
++static void laya_ggml_trace_cpp(const char * text) {
++    const char * flag = getenv("LAYA_DEBUG");
++    if (!flag || !*flag || *flag == '0') return;
++    fprintf(stderr, "[laya] ggml: %s\n", text);
++    fflush(stderr);
++}
++
+ ggml_backend_t ggml_backend_cpu_init(void) {
+     // initialize CPU backend now to avoid slowing the first graph computation
++    laya_ggml_trace_cpp("backend_cpu_init: enter");
+     ggml_cpu_init();
++    laya_ggml_trace_cpp("backend_cpu_init: registering the device (reads the CPU name from the registry)");
+ 
+     struct ggml_backend_cpu_context * ctx = new ggml_backend_cpu_context;
+     if (ctx == NULL) {
+@@ -243,6 +252,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
+         return NULL;
+     }
+ 
++    laya_ggml_trace_cpp("backend_cpu_init: done");
+     return cpu_backend;
+ }
+ 
+diff --git a/src/ggml.c b/src/ggml.c
+index 5ef03e1..657d04e 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1610,8 +1610,12 @@ static inline bool ggml_can_repeat_rows(const struct ggml_tensor * t0, const str
+ 
+ struct ggml_context * ggml_init(struct ggml_init_params params) {
+     static bool is_first_call = true;
++    const char * laya_flag = is_first_call ? getenv("LAYA_DEBUG") : NULL;
++    const bool laya_trace = laya_flag && *laya_flag && *laya_flag != '0';
++    if (laya_trace) { fputs("[laya] ggml: init: taking the lock\n", stderr); fflush(stderr); }
+ 
+     ggml_critical_section_start();
++    if (laya_trace) { fputs("[laya] ggml: init: lock taken, starting the timer\n", stderr); fflush(stderr); }
+ 
+     if (is_first_call) {
+         // initialize time system (required on Windows)
+@@ -1621,6 +1625,7 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
+     }
+ 
+     ggml_critical_section_end();
++    if (laya_trace) { fputs("[laya] ggml: init: lock released\n", stderr); fflush(stderr); }
+ 
+     struct ggml_context * ctx = GGML_MALLOC(sizeof(struct ggml_context));
+ 

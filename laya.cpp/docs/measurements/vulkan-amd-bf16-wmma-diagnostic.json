@@ -1,0 +1,315 @@
+{
+  "schema_version": 1,
+  "scope": "Isolated first English encoder QKV projection for billing-01; hardware arithmetic diagnostic, not a validated Vulkan implementation.",
+  "gpu": "Radeon 8060S Graphics",
+  "torch": "2.11.0+rocm7.13.0",
+  "projection": {
+    "input_shape": [
+      54,
+      1024
+    ],
+    "weight_shape": [
+      3072,
+      1024
+    ],
+    "output_elements": 165888,
+    "accumulation": "Ascending K in groups of 16, native WMMA FP32 accumulator"
+  },
+  "boundary_check": {
+    "gpu": "Radeon 8060S Graphics",
+    "torch": "2.11.0+rocm7.13.0",
+    "input_gpu_cpu_cast_differences": 0,
+    "weight_gpu_cpu_cast_differences": 0,
+    "input_not_exact_fp16": 5,
+    "weight_not_exact_fp16": 0,
+    "manual_bf16_linear_vs_model_differences": 0,
+    "manual_bf16_linear_vs_model_max_error": 0.0
+  },
+  "modes": [
+    {
+      "mode": "bf16",
+      "swap": true,
+      "max_error": 0.0,
+      "raw_vs_bf16_differences": 0,
+      "input_values_not_exact_in_fp16_at_scale": 5,
+      "stored_bf16_tensor_differences": 0
+    },
+    {
+      "mode": "fp16",
+      "swap": true,
+      "max_error": 0.0,
+      "raw_vs_bf16_differences": 846,
+      "input_values_not_exact_in_fp16_at_scale": 5,
+      "stored_bf16_tensor_differences": 0
+    },
+    {
+      "mode": "fp16-scaled-16",
+      "swap": true,
+      "max_error": 0.0,
+      "raw_vs_bf16_differences": 0,
+      "input_values_not_exact_in_fp16_at_scale": 0,
+      "stored_bf16_tensor_differences": 0
+    },
+    {
+      "mode": "fp16-scaled-256",
+      "swap": true,
+      "max_error": 0.0,
+      "raw_vs_bf16_differences": 0,
+      "input_values_not_exact_in_fp16_at_scale": 0,
+      "stored_bf16_tensor_differences": 0
+    }
+  ],
+  "fixed_scale_trace_coverage": {
+    "1": {
+      "inexact_tensors": 96,
+      "inexact_values": 1858
+    },
+    "16": {
+      "inexact_tensors": 36,
+      "inexact_values": 186
+    },
+    "256": {
+      "inexact_tensors": 14,
+      "inexact_values": 36
+    }
+  },
+  "per_vector_scale_trace_coverage": {
+    "tensors": 114,
+    "vectors": 6156,
+    "vectors_without_exact_scale": 0,
+    "tested_powers_of_two": [
+      -8,
+      -7,
+      -6,
+      -5,
+      -4,
+      -3,
+      -2,
+      -1,
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24
+    ]
+  },
+  "artifact_sha256": {
+    "research/wmma_qkv.cpp": "39d7fa67e40b158984f4763f7e2d78cf0c3c261573bf673dde5ff13b420633a4",
+    "research/run_wmma_qkv.py": "84bd9f05d6f2fe660a4635dac6608abc78ba44cad645473606267c542f0933ba",
+    "research/wmma-qkv-output.bin": "3c5e93f3ec4946a36b246941d320811523954675701017e8470bad20449c3ca5",
+    "research/amd-bf16-cast-inputs.npz": "0f4e7a4b9a765d95cce93be3711dfc6e5bd4345655cd68a4618a37b57861307d"
+  },
+  "limitations": [
+    "Single request trace; no general representability guarantee.",
+    "Fixed scaling fails to preserve some other layer inputs.",
+    "No end-to-end BF16 correctness or performance claim."
+  ],
+  "vulkan_fixed_scale_probe": {
+    "scope": "First encoder QKV only; fixed scaling is not general",
+    "elements": 165888,
+    "differences": 0,
+    "max_error": 0.0,
+    "input_scale": 16,
+    "implementation": "BF16 buffer decoding into FP16 cooperative-matrix operands, FP32 accumulation, exact output unscaling; no native Vulkan BF16 cooperative-matrix capability required",
+    "validated_scope": "First captured QKV only; not general model inference",
+    "artifact_sha256": {
+      "research/build_amd_bf16_scaled_probe.py": "9a75143b3bdd6c770f01558ed06294f139a847070c039ec5498990fd7279acdd",
+      "research/amd-bf16-scaled-probe/scaled.comp": "888970e56453663958968aba82fbfa3ff914e409ccf2ed4bf6b9ac516aa265e7",
+      "research/amd-bf16-scaled-probe/mul_mm_funcs.glsl": "2fc0c6a59efc4230c9e79799e38ba47bebe5725e76a641b0c939ac2a7278e9f5",
+      "research/amd-bf16-scaled-probe/libggml-vulkan.so.0": "a055e6214f95d5b0eb617a00b5dbea5d3eef6ad9d526ec418d74eb891ab9f596"
+    }
+  },
+  "vulkan_dynamic_scale_probe": {
+    "scope": "First encoder QKV with exact dynamic per-vector scaling",
+    "elements": 165888,
+    "differences": 0,
+    "max_error": 0.0,
+    "conversion": "Choose maximum finite FP16 power-of-two scale independently per input vector and verify every conversion; nonrepresentable vectors produce nonfinite diagnostic outputs.",
+    "full_model_accepted": false,
+    "artifact_sha256": {
+      "research/build_amd_bf16_dynamic_probe.py": "691d4cd694cdc58925cc1fc1d57a640d7fc760f35f5cbb8b8ba6120ec9b8b4a8",
+      "research/amd-bf16-dynamic-probe/scaled.comp": "a3333b1de7b1d98cb8f7024388e81aac0649314859a62ba9cc2202f576c87686",
+      "research/amd-bf16-dynamic-probe/mul_mm_funcs.glsl": "ac02cc928a84fe8a295bd7301641dc7e69b6b6a13dd3bb9559019c8facd7bc1e",
+      "research/amd-bf16-dynamic-probe/libggml-vulkan.so.0": "572c66b5fb281c6bda164a5cffc77046d3ae682c9314701150266a14fd1c96a9"
+    }
+  },
+  "combined_projection_attention_diagnostic": {
+    "case": "billing-01",
+    "matched_common_trace_tensors": 238,
+    "oracle_trace_tensors": 384,
+    "trace_comparison": "Common tensors of identical size; attention projection inputs rounded to BF16 at their storage boundary; absent trace points are not asserted.",
+    "public_answer": {
+      "type": "choice",
+      "confidence": 0.4027,
+      "action": {
+        "act_probability": 1.0
+      },
+      "choice": "billing",
+      "probabilities": {
+        "billing": 0.7868,
+        "technical support": 0.1387,
+        "sales": 0.0745
+      }
+    },
+    "encoder_projection_replay": {
+      "projections": 112,
+      "elements": 15676416,
+      "mismatching_values": 0,
+      "nonfinite_values": 0,
+      "method": "Independent BF16 matrix replay with captured Python input for each bias-free encoder projection; BF16 stored output comparison prevents cascading errors."
+    },
+    "full_corpus_validation": "failed for batches 4 and 8",
+    "performance": "not measured",
+    "artifact_sha256": {
+      "research/build_amd_bf16_combined_probe.py": "215aea3f62ecd65cb1415a006783ff0345735000ed712b92c70f143615e018c5",
+      "research/build_amd_bf16_combined_runtime.py": "308fa3d380c8f39a110f5be93efb847dabd03dd1125b30a6ec3ff752cc9bd930",
+      "research/amd-bf16-combined-probe/libggml-vulkan.so.0": "9a33ce06ddd03a0159ab73d2934243e6a4ea8b7c4daaf961ae02a735d6a85358",
+      "research/amd-bf16-combined-runtime/liblaya.so": "c9fb16569858166087404987b76b8265c9f50de96b718a976e9101947a7447b2",
+      "research/amd-bf16-projection-replay.json": "43b183a3b7aac9632cc273fdf66657ddf28acc8b09ea1545bffb22c4c47cc8ef",
+      "research/amd-bf16-combined-comparison.log": "d6678343aa22310968b215e549fbc8e55b62c8873ef23dca1f31fe229527817f"
+    }
+  },
+  "english_full_corpus_gate": {
+    "passed": false,
+    "native_build_sha256": "0761e0acde6caca989bb494ee18d3c75b6d50e37c2884d8387e1a0dbb053abd7",
+    "cases_sha256": "cd991ea8d6c4ac2124f96672d0552780e2ae06839313f147f1f1ac9af6d3bab4",
+    "weights_sha256": "891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c",
+    "report_sha256": "ad3df13edcd49b88d277f196702758282179761a64852d0af97ea1051d5d8cc5",
+    "answer_atol": 0.0001,
+    "batches": [
+      {
+        "batch_size": 1,
+        "questions": 250,
+        "answer_failures": 0,
+        "max_logit_error": 0.0,
+        "max_action_error": 0.0
+      },
+      {
+        "batch_size": 2,
+        "questions": 250,
+        "answer_failures": 0,
+        "max_logit_error": 0.00048828125,
+        "max_action_error": 0.0
+      },
+      {
+        "batch_size": 4,
+        "questions": 250,
+        "answer_failures": 30,
+        "max_logit_error": 0.25,
+        "max_action_error": 32.0
+      },
+      {
+        "batch_size": 8,
+        "questions": 250,
+        "answer_failures": 52,
+        "max_logit_error": 0.125,
+        "max_action_error": 32.0
+      }
+    ]
+  },
+  "extended_projection_full_corpus": {
+    "model": "english",
+    "precision": "bf16",
+    "passed": false,
+    "report_sha256": "3136e318311b9e698d29110a894e958fd0508df0af0c691dca2cc1e12833d46e",
+    "batches": [
+      {
+        "batch_size": 1,
+        "questions": 250,
+        "input_failures": 0,
+        "answer_failures": []
+      },
+      {
+        "batch_size": 2,
+        "questions": 250,
+        "input_failures": 0,
+        "answer_failures": []
+      },
+      {
+        "batch_size": 4,
+        "questions": 250,
+        "input_failures": 0,
+        "answer_failures": [
+          {
+            "id": "expense-06",
+            "error": "result.answers.expense-06.score: 1.8978 != 1.896 (tolerance 0.0001)"
+          },
+          {
+            "id": "travel-01",
+            "error": "result.answers.travel-01.probabilities.data engineering: 0.354 != 0.3542 (tolerance 0.0001)"
+          },
+          {
+            "id": "quoted_content-04",
+            "error": "result.answers.quoted_content-04.probabilities.customer message: 0.5435 != 0.5483 (tolerance 0.0001)"
+          }
+        ]
+      },
+      {
+        "batch_size": 8,
+        "questions": 250,
+        "input_failures": 0,
+        "answer_failures": [
+          {
+            "id": "travel-09",
+            "error": "result.answers.travel-09.noul: 0.7975 != 0.7978 (tolerance 0.0001)"
+          },
+          {
+            "id": "quoted_content-07",
+            "error": "result.answers.quoted_content-07.score: 0.0846 != 0.0856 (tolerance 0.0001)"
+          }
+        ]
+      }
+    ]
+  },
+  "multilingual_bf16_batched_scalar_v2_gate": {
+    "passed": false,
+    "report_sha256": "00fdc4d75be6bf9873adc834562dbb0d78fdb62f32ff79c8abbe8e37f960dfcd",
+    "batches": [
+      {
+        "batch_size": 1,
+        "questions": 250,
+        "input_failures": 0,
+        "answer_failures": 223
+      },
+      {
+        "batch_size": 2,
+        "questions": 250,
+        "input_failures": 0,
+        "answer_failures": 225
+      },
+      {
+        "batch_size": 4,
+        "questions": 250,
+        "input_failures": 0,
+        "answer_failures": 227
+      },
+      {
+        "batch_size": 8,
+        "questions": 250,
+        "input_failures": 0,
+        "answer_failures": 227
+      }
+    ],
+    "scope": "The English projection and head fixes do not yet establish multilingual correctness."
+  }
+}

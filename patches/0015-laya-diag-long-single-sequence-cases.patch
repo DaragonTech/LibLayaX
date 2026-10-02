@@ -1,0 +1,63 @@
+From b788cedb89ec748a777d185a9131aefddfe938bc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 21:28:16 +0100
+Subject: [PATCH 15/30] laya-diag: long single-sequence cases
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ tests/capi/diag_capi.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/tests/capi/diag_capi.c b/tests/capi/diag_capi.c
+index e28e2b9..afedd98 100644
+--- a/tests/capi/diag_capi.c
++++ b/tests/capi/diag_capi.c
+@@ -78,7 +78,7 @@ static int compare(laya_agent* cpu, laya_agent* gpu, const char* name, const cha
+     double d = diff(g, c);
+     int ok = d >= 0 && d <= 0.02;
+     printf("%-45s %s  (largest difference %.4f)\n", name, ok ? "OK  " : "WRONG", d);
+-    if (!ok) printf("   gpu: %.300s\n   cpu: %.300s\n", g, c);
++    if (!ok && getenv("LAYA_DIAG_VERBOSE")) printf("-> gpu: %.160s\n-> cpu: %.160s\n", g, c);
+     fflush(stdout);
+     free(c); free(g);
+     return ok;
+@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
+         int ok = d >= 0 && d <= 0.02;
+         bad += !ok;
+         printf("%-45s %s  (largest difference %.4f)\n", names[i], ok ? "OK  " : "WRONG", d);
+-        if (!ok) printf("   gpu: %.300s\n   cpu: %.300s\n", g, c);
++        if (!ok) printf("-> gpu: %.160s\n-> cpu: %.160s\n", g, c);
+         fflush(stdout);
+         free(c); free(g);
+     }
+@@ -122,6 +122,26 @@ int main(int argc, char** argv) {
+         bad += !compare(cpu, gpu, name, req);
+         free(req); ++total;
+     }
++    /* one long sequence: tests whether size, not batch count, is the trigger */
++    static const int sentences[] = {10, 20, 32};
++    const char* sentence = "My order arrived broken and I would like my money back please. ";
++    for (size_t i = 0; i < sizeof sentences / sizeof sentences[0]; ++i) {
++        size_t sl = strlen(sentence);
++        char* state = (char*)malloc(sl * sentences[i] + 1);
++        state[0] = 0;
++        for (int k = 0; k < sentences[i]; ++k) strcat(state, sentence);
++        char* req = (char*)malloc(strlen(state) + 256);
++        sprintf(req, "{\"state\":\"%s\",\"questions\":" Q_CHOICE "}", state);
++        char* prep = laya_prepare(cpu, req);
++        const char* lp = prep ? strstr(prep, "\"length\":") : NULL;
++        int tokens = lp ? atoi(lp + 9) : -1;
++        laya_free_string(prep);
++        char name[64];
++        snprintf(name, sizeof name, "%c  1 long sequence (%d tokens)", 'S' + (int)i, tokens);
++        if (tokens < 0) printf("%-45s skipped (longer than the model accepts)\n", name);
++        else bad += !compare(cpu, gpu, name, req);
++        free(state); free(req); ++total;
++    }
+     laya_destroy(gpu);
+     laya_destroy(cpu);
+     printf("\n%d of %d cases wrong\n", bad, total);
+-- 
+2.43.0
+

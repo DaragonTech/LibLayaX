@@ -1,0 +1,87 @@
+From 4650e8d7f3ca11d7528fc00201a0bb7d11ea38bb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 2 Oct 2026 14:31:50 +0100
+Subject: [PATCH 29/30] capi: laya.def and import library (laya.lib) for Visual
+ C++ on Windows x64 and ARM64
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/README.md                      |  6 ++++++
+ capi/laya.def                       | 16 ++++++++++++++++
+ scripts/capi/build-arm64.sh         |  3 +++
+ scripts/capi/build-windows-mingw.sh |  4 ++++
+ 4 files changed, 29 insertions(+)
+ create mode 100644 capi/laya.def
+
+diff --git a/capi/README.md b/capi/README.md
+index b950431..c02f7e2 100644
+--- a/capi/README.md
++++ b/capi/README.md
+@@ -55,6 +55,12 @@ GPU). Unknown keys are rejected, so typos fail loudly.
+   validated checkpoints) still terminate the process. The message is sent to your log callback
+   first.
+ 
++## Linking from C or C++
++
++Include `laya_c.h` and link the library: `-llaya` on Linux, macOS and MinGW. Visual C++ needs
++the import library `laya.lib`, which the Windows build scripts make from `capi/laya.def`
++(`lib /def:laya.def /machine:x64 /out:laya.lib` does the same by hand).
++
+ ## Diagnostics (environment variables)
+ 
+ * `LAYA_DEBUG=1`: every entry point prints its progress on stderr as `[laya] ...` lines,
+diff --git a/capi/laya.def b/capi/laya.def
+new file mode 100644
+index 0000000..d0c67cd
+--- /dev/null
++++ b/capi/laya.def
+@@ -0,0 +1,16 @@
++; Exports of laya.dll. An import library for Visual C++ can be made from this file with
++;   lib /def:laya.def /machine:x64 /out:laya.lib        (or /machine:arm64)
++; or, without Visual Studio,
++;   llvm-dlltool -m i386:x86-64 -d laya.def -D laya.dll -l laya.lib   (or -m arm64)
++LIBRARY laya.dll
++EXPORTS
++    laya_api_version
++    laya_create
++    laya_destroy
++    laya_free_string
++    laya_info
++    laya_last_error
++    laya_predict
++    laya_prepare
++    laya_set_log_callback
++    laya_version
+diff --git a/scripts/capi/build-arm64.sh b/scripts/capi/build-arm64.sh
+index 681ca6a..cd7275d 100755
+--- a/scripts/capi/build-arm64.sh
++++ b/scripts/capi/build-arm64.sh
+@@ -67,6 +67,9 @@ for target in $TARGETS; do
+     -DICU_I18N_LIBRARY_RELEASE="$prefix/lib/$in" -DICU_DATA_LIBRARY_RELEASE="$prefix/lib/$dt" \
+     -DCMAKE_CXX_FLAGS=-DU_STATIC_IMPLEMENTATION -Dnlohmann_json_DIR="$WORK/nl/share/cmake/nlohmann_json"
+   cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi laya-cli laya-bench laya-diag laya-probe $tools
++  if [ $target = windows ]; then  # import library for Visual C++ users
++    "$M/llvm-dlltool" -m arm64 -d "$ROOT/capi/laya.def" -D laya.dll -l "$B/bin/laya.lib"
++  fi
+   echo "== $target arm64: $B/bin"
+   if [ $target = linux ] && [ "${RUN_TESTS:-0}" = 1 ]; then
+     (cd "$B/bin" && LAYA_TEST_QUICK=1 qemu-aarch64-static -L /usr/aarch64-linux-gnu -E LD_LIBRARY_PATH=. ./test-capi) || [ $? = 77 ]
+diff --git a/scripts/capi/build-windows-mingw.sh b/scripts/capi/build-windows-mingw.sh
+index f985b72..54c8efe 100755
+--- a/scripts/capi/build-windows-mingw.sh
++++ b/scripts/capi/build-windows-mingw.sh
+@@ -69,6 +69,10 @@ for variant in ${VARIANTS:-avx2 compat}; do
+     "-DCMAKE_CXX_FLAGS=$cxxflags" -Dnlohmann_json_DIR="$WORK/nl/share/cmake/nlohmann_json"
+   cmake --build "$B" --parallel "$JOBS" --target laya_c test-capi laya-bench laya-diag laya-probe laya-cli
+   x86_64-w64-mingw32-strip --strip-unneeded "$B/bin/laya.dll"
++  # Import library for Visual C++ users (MinGW can link the DLL directly). llvm-dlltool writes
++  # the short import format link.exe expects; GNU dlltool's output also works with it.
++  "$(command -v llvm-dlltool || command -v llvm-dlltool-18 || echo x86_64-w64-mingw32-dlltool)" \
++    -m i386:x86-64 -d "$ROOT/capi/laya.def" -D laya.dll -l "$B/bin/laya.lib"
+   echo "== $variant: $B/bin/laya.dll"
+   x86_64-w64-mingw32-objdump -p "$B/bin/laya.dll" | grep "DLL Name"
+ 
+-- 
+2.43.0
+

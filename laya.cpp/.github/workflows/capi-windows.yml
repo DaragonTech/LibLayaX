@@ -1,0 +1,122 @@
+name: laya.dll (Windows C API)
+
+# Builds laya.dll (the flat C ABI in capi/) with MSVC for CPU, Vulkan and CUDA, tests it against a
+# synthetic checkpoint on the runner's CPU, and uploads one zip per variant. Run it from the
+# Actions tab ("Run workflow") or on pushes that touch the library.
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['capi/**', 'tests/capi/**', 'src/**', 'include/**', 'CMakeLists.txt', '.github/workflows/capi-windows.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, vulkan, cuda12]
+    runs-on: windows-2022
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: MSVC
+        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c
+
+      - name: vcpkg (pinned like the release workflow)
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: 398e9a716997ec84676dc7c7afdd51afcede2269
+          path: release-vcpkg
+      - name: Cache static dependencies
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: release-vcpkg/installed
+          key: release-vcpkg-static-398e9a716997ec84676dc7c7afdd51afcede2269-windows-2022
+      - name: Build static ICU and nlohmann-json
+        if: steps.deps.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          ./release-vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./release-vcpkg/vcpkg.exe install icu:x64-windows-static nlohmann-json:x64-windows-static
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: CUDA toolkit
+        if: matrix.variant == 'cuda12'
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d
+        with:
+          cuda: '12.9.1'
+      - name: Vulkan SDK
+        if: matrix.variant == 'vulkan'
+        shell: pwsh
+        env:
+          SDK_VERSION: '1.4.357.0'
+        run: |
+          $installer = "$env:RUNNER_TEMP/VulkanSDK-Installer.exe"
+          curl.exe --fail --location --output $installer "https://sdk.lunarg.com/sdk/download/$env:SDK_VERSION/windows/vulkansdk-windows-X64-$env:SDK_VERSION.exe"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLower() -ne '81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d') { throw 'Vulkan SDK checksum mismatch' }
+          & $installer --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "VULKAN_SDK=C:\VulkanSDK\$env:SDK_VERSION" >> $env:GITHUB_ENV
+          "C:\VulkanSDK\$env:SDK_VERSION\Bin" >> $env:GITHUB_PATH
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $opts = @('-DLAYA_PORTABLE=ON', '-DLAYA_C_API=ON', '-DCMAKE_BUILD_TYPE=Release',
+                    "-DCMAKE_TOOLCHAIN_FILE=$pwd/release-vcpkg/scripts/buildsystems/vcpkg.cmake",
+                    '-DVCPKG_TARGET_TRIPLET=x64-windows-static',
+                    '-DGGML_AVX=ON', '-DGGML_AVX2=ON', '-DGGML_FMA=ON', '-DGGML_F16C=ON')
+          switch ('${{ matrix.variant }}') {
+            'cpu'    { $opts += @('-DLAYA_CUDA=OFF', '-DLAYA_VULKAN=OFF') }
+            'vulkan' { $opts += @('-DLAYA_CUDA=OFF', '-DLAYA_VULKAN=ON', "-DCMAKE_PREFIX_PATH=$env:VULKAN_SDK") }
+            'cuda12' { $opts += @('-DLAYA_CUDA=ON', '-DLAYA_VULKAN=OFF', '-DCMAKE_CUDA_ARCHITECTURES=70;75;80;86;89;90;120',
+                                  "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe", "-DCUDAToolkit_ROOT=$env:CUDA_PATH",
+                                  '-DCMAKE_CUDA_FLAGS=-t 2') }
+          }
+          cmake -S . -B build -G Ninja @opts
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build
+        run: cmake --build build --config Release --parallel 3 --target laya_c test-capi laya-cli
+
+      - name: Contract tests
+        run: ctest --test-dir build -C Release --output-on-failure -R "^capi$"
+
+      - name: End-to-end tests on a synthetic checkpoint (CPU backend)
+        shell: pwsh
+        run: |
+          python -m pip install --quiet numpy tokenizers
+          python tests/capi/make_synthetic_model.py "$env:RUNNER_TEMP/synth"
+          $env:LAYA_TEST_MODEL = "$env:RUNNER_TEMP/synth"
+          ./build/bin/test-capi.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/capi/test_parity.py --lib build/bin/laya.dll --cli build/bin/laya-cli.exe --model "$env:RUNNER_TEMP/synth"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "dist/laya-dll-windows-x64-${{ matrix.variant }}"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item build/bin/laya.dll, capi/laya_c.h, capi/laya.def, capi/README.md $out
+          if ('${{ matrix.variant }}' -eq 'cuda12') {
+            # cuBLAS is linked dynamically on Windows (CUDA EULA permits redistribution of these DLLs).
+            Copy-Item "$env:CUDA_PATH/bin/cublas64_12.dll", "$env:CUDA_PATH/bin/cublasLt64_12.dll" $out
+          }
+          dumpbin /dependents build/bin/laya.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: laya-dll-windows-x64-${{ matrix.variant }}
+          path: dist/*
+          if-no-files-found: error

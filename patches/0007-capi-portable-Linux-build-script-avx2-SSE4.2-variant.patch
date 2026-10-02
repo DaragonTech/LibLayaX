@@ -1,0 +1,79 @@
+From 7fcee59ceb59747727b38a90af8f6cbbb731ae59 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 19:14:24 +0100
+Subject: [PATCH 07/30] capi: portable Linux build script (avx2 + SSE4.2
+ variants, static ICU and libstdc++)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ scripts/capi/build-linux.sh | 57 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+ create mode 100755 scripts/capi/build-linux.sh
+
+diff --git a/scripts/capi/build-linux.sh b/scripts/capi/build-linux.sh
+new file mode 100755
+index 0000000..b61fc8c
+--- /dev/null
++++ b/scripts/capi/build-linux.sh
+@@ -0,0 +1,57 @@
++#!/usr/bin/env bash
++# Build portable liblaya.so variants (Linux x86-64, CPU backend):
++#   build-linux-avx2/bin/liblaya.so    AVX2/FMA/F16C/BMI2 baseline (fast, ~2013+ CPUs)
++#   build-linux-compat/bin/liblaya.so  SSE4.2 baseline (any x86-64 since ~2009, and emulators)
++# ICU, libstdc++ and libgcc are linked in statically, so the library needs only glibc
++# (libc, libm, libpthread) from the system and works across distributions of the same or newer
++# glibc than the build machine.
++#
++#   scripts/capi/build-linux.sh            # build both
++#   VARIANTS=compat scripts/capi/build-linux.sh
++#
++# Needs: cmake ninja-build g++ nlohmann-json3-dev curl
++set -euo pipefail
++ROOT=$(cd "$(dirname "$0")/../.." && pwd)
++WORK=${WORK:-$ROOT/build-deps}
++ICU_VERSION=${ICU_VERSION:-76-1}
++ICU_TGZ=icu4c-${ICU_VERSION/-/_}-src.tgz
++JOBS=${JOBS:-$(nproc)}
++VARIANTS=${VARIANTS:-"avx2 compat"}
++VERSION=${LAYA_C_VERSION:-1.0.5}
++mkdir -p "$WORK" && cd "$WORK"
++
++# 1. Static, position-independent ICU (the system one is a shared, version-specific library).
++if [ ! -f icu-linux-static/lib/libicuuc.a ]; then
++  [ -f "$ICU_TGZ" ] || curl -fsSL -o "$ICU_TGZ" "https://github.com/unicode-org/icu/releases/download/release-$ICU_VERSION/$ICU_TGZ"
++  [ -d icu ] || tar xzf "$ICU_TGZ"
++  rm -rf icu-linux-static-build && mkdir icu-linux-static-build
++  (cd icu-linux-static-build && CFLAGS="-O2 -fPIC" CXXFLAGS="-O2 -fPIC -std=c++17" \
++     ../icu/source/runConfigureICU Linux --enable-static --disable-shared --with-data-packaging=static \
++       --disable-tests --disable-samples --disable-extras --disable-tools --disable-dyload \
++       --prefix="$WORK/icu-linux-static" >/dev/null && make -j"$JOBS" >/dev/null && (make install >/dev/null 2>&1 || true))
++  # Like the MinGW cross build, the static data archive may not be installed; place it by hand.
++  [ -f icu-linux-static/lib/libicudata.a ] || cp icu-linux-static-build/lib/libsicudt.a icu-linux-static/lib/libicudata.a 2>/dev/null \
++    || cp icu-linux-static-build/lib/libicudata.a icu-linux-static/lib/libicudata.a
++fi
++I=$WORK/icu-linux-static
++
++# 2. One build per CPU baseline.
++for variant in $VARIANTS; do
++  case $variant in
++    avx2)   isa=(-DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON) ;;
++    compat) isa=(-DGGML_SSE42=ON -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF) ;;
++    *) echo "unknown variant $variant" >&2; exit 1 ;;
++  esac
++  cmake -S "$ROOT" -B "$ROOT/build-linux-$variant" -G Ninja -DCMAKE_BUILD_TYPE=Release \
++    -DLAYA_CUDA=OFF -DLAYA_C_API=ON -DBUILD_SHARED_LIBS=OFF -DLAYA_C_VERSION="$VERSION" \
++    -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF "${isa[@]}" \
++    -DICU_ROOT="$I" -DICU_INCLUDE_DIR="$I/include" -DICU_UC_LIBRARY_RELEASE="$I/lib/libicuuc.a" \
++    -DICU_I18N_LIBRARY_RELEASE="$I/lib/libicui18n.a" -DICU_DATA_LIBRARY_RELEASE="$I/lib/libicudata.a" \
++    -DCMAKE_CXX_FLAGS="-DU_STATIC_IMPLEMENTATION" \
++    -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
++    -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
++  cmake --build "$ROOT/build-linux-$variant" --parallel "$JOBS" --target laya_c test-capi laya-cli
++  strip --strip-unneeded "$ROOT/build-linux-$variant/bin/liblaya.so"
++  echo "== $variant: $ROOT/build-linux-$variant/bin/liblaya.so"
++  readelf -d "$ROOT/build-linux-$variant/bin/liblaya.so" | grep NEEDED
++done
+-- 
+2.43.0
+

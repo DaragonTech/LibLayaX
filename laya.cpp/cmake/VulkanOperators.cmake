@@ -1,0 +1,111 @@
+set(laya_norm_header "${CMAKE_CURRENT_BINARY_DIR}/laya_norm.spv.h")
+add_custom_command(OUTPUT "${laya_norm_header}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -mfmt=c
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/norm.comp" -o "${laya_norm_header}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/norm.comp" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/rounding.glsl" VERBATIM)
+set(laya_amd_norm_header "${CMAKE_CURRENT_BINARY_DIR}/laya_amd_norm.spv.h")
+add_custom_command(OUTPUT "${laya_amd_norm_header}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -mfmt=c -DLAYA_AMD_NORM=1
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/norm.comp" -o "${laya_amd_norm_header}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/norm.comp" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/rounding.glsl" VERBATIM)
+set(laya_activation_header "${CMAKE_CURRENT_BINARY_DIR}/laya_activation.spv.h")
+add_custom_command(OUTPUT "${laya_activation_header}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -mfmt=c
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/activation.comp" -o "${laya_activation_header}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/activation.comp" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/rounding.glsl" VERBATIM)
+add_custom_target(laya-vulkan-shaders DEPENDS "${laya_norm_header}" "${laya_amd_norm_header}" "${laya_activation_header}")
+add_dependencies(ggml-vulkan laya-vulkan-shaders)
+target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_BINARY_DIR}")
+laya_vk_replace("#include \"ggml-vulkan-shaders.hpp\""
+  "#include \"ggml-vulkan-shaders.hpp\"\nstatic const uint32_t laya_norm_spv[] =\n#include \"laya_norm.spv.h\"\n;")
+laya_vk_replace("#include \"ggml-vulkan-shaders.hpp\""
+  "#include \"ggml-vulkan-shaders.hpp\"\n#include \"vulkan/strict_spirv.hpp\"\nstatic const uint32_t laya_amd_norm_spv[] =\n#include \"laya_amd_norm.spv.h\"\n;")
+laya_vk_replace("    vk_pipeline pipeline_norm_f32;"
+  "    vk_pipeline pipeline_norm_f32;\n    vk_pipeline pipeline_laya_norm;")
+laya_vk_replace(
+  "    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,"
+  "    {\n        const bool amd = device->vendor_id == VK_VENDOR_ID_AMD;\n        static const auto strict_norm = laya::vulkan_precision::preserve_spirv_fma(laya_amd_norm_spv, sizeof(laya_amd_norm_spv)/sizeof(uint32_t));\n        ggml_vk_create_pipeline(device, device->pipeline_laya_norm, \"laya_norm\", amd ? strict_norm.size()*sizeof(uint32_t) : sizeof(laya_norm_spv), amd ? strict_norm.data() : laya_norm_spv, \"main\", 4, 16, {1,1,1}, {amd ? 256u : 128u}, 1);\n    }\n    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,")
+laya_vk_replace(
+  "// Returns true if node has enqueued work into the queue, false otherwise"
+  "#include \"vulkan_dispatch.hpp\"\n// Returns true if node has enqueued work into the queue, false otherwise")
+laya_vk_replace(
+  "    case GGML_OP_NORM:\n        ggml_vk_norm(ctx, compute_ctx, src0, node);"
+  "    case GGML_OP_CUSTOM:\n        laya_vk_custom(ctx, compute_ctx, node);\n        break;\n    case GGML_OP_NORM:\n        ggml_vk_norm(ctx, compute_ctx, src0, node);")
+laya_vk_replace(
+  "    switch (op->op) {\n        case GGML_OP_UNARY:"
+  "    switch (op->op) {\n        case GGML_OP_CUSTOM: return laya_vk_supports(op);\n        case GGML_OP_UNARY:")
+
+laya_vk_replace("#include \"ggml-vulkan-shaders.hpp\""
+  "#include \"ggml-vulkan-shaders.hpp\"\nstatic const uint32_t laya_activation_spv[] =\n#include \"laya_activation.spv.h\"\n;")
+laya_vk_replace("    vk_pipeline pipeline_norm_f32;"
+  "    vk_pipeline pipeline_norm_f32;\n    vk_pipeline pipeline_laya_activation;")
+laya_vk_replace("    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,"
+  "    ggml_vk_create_pipeline(device, device->pipeline_laya_activation, \"laya_activation\", sizeof(laya_activation_spv), laya_activation_spv, \"main\", 3, 16, {256,1,1}, {}, 1);\n    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,")
+
+foreach(operation split merge reduce serial)
+  set(laya_compensated_header "${CMAKE_CURRENT_BINARY_DIR}/laya_${operation}.spv.h")
+  set(laya_compensated_flags)
+  set(laya_compensated_bindings 2)
+  if(operation STREQUAL "split")
+    set(laya_compensated_flags -DSPLIT=1)
+  elseif(operation STREQUAL "serial")
+    set(laya_compensated_flags -DSERIAL=1)
+    set(laya_compensated_bindings 3)
+  elseif(operation STREQUAL "reduce")
+    set(laya_compensated_flags -DREDUCE=1)
+  endif()
+  add_custom_command(OUTPUT "${laya_compensated_header}"
+    COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -mfmt=c ${laya_compensated_flags}
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/compensated.comp" -o "${laya_compensated_header}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/compensated.comp" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/rounding.glsl" VERBATIM)
+  add_custom_target(laya-vulkan-${operation} DEPENDS "${laya_compensated_header}")
+  add_dependencies(ggml-vulkan laya-vulkan-${operation})
+  laya_vk_replace("#include \"ggml-vulkan-shaders.hpp\""
+    "#include \"ggml-vulkan-shaders.hpp\"\nstatic const uint32_t laya_${operation}_spv[] =\n#include \"laya_${operation}.spv.h\"\n;")
+  laya_vk_replace("    vk_pipeline pipeline_norm_f32;"
+    "    vk_pipeline pipeline_norm_f32;\n    vk_pipeline pipeline_laya_${operation};")
+  laya_vk_replace("    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,"
+    "    ggml_vk_create_pipeline(device, device->pipeline_laya_${operation}, \"laya_${operation}\", sizeof(laya_${operation}_spv), laya_${operation}_spv, \"main\", ${laya_compensated_bindings}, 16, {256,1,1}, {}, 1);\n    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,")
+endforeach()
+
+set(laya_finish_header "${CMAKE_CURRENT_BINARY_DIR}/laya_finish_projection.spv.h")
+add_custom_command(OUTPUT "${laya_finish_header}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -mfmt=c
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/finish_projection.comp" -o "${laya_finish_header}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/finish_projection.comp" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/rounding.glsl" VERBATIM)
+add_custom_target(laya-vulkan-finish-projection DEPENDS "${laya_finish_header}")
+add_dependencies(ggml-vulkan laya-vulkan-finish-projection)
+laya_vk_replace("#include \"ggml-vulkan-shaders.hpp\""
+  "#include \"ggml-vulkan-shaders.hpp\"\nstatic const uint32_t laya_finish_projection_spv[] =\n#include \"laya_finish_projection.spv.h\"\n;")
+laya_vk_replace("    vk_pipeline pipeline_norm_f32;"
+  "    vk_pipeline pipeline_norm_f32;\n    vk_pipeline pipeline_laya_finish_projection;")
+laya_vk_replace("    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,"
+  "    ggml_vk_create_pipeline(device, device->pipeline_laya_finish_projection, \"laya_finish_projection\", sizeof(laya_finish_projection_spv), laya_finish_projection_spv, \"main\", 4, 16, {256,1,1}, {}, 1);\n    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,")
+
+set(laya_pack_header "${CMAKE_CURRENT_BINARY_DIR}/laya_pack_qkv.spv.h")
+add_custom_command(OUTPUT "${laya_pack_header}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -mfmt=c
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/pack_qkv.comp" -o "${laya_pack_header}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/pack_qkv.comp" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/rounding.glsl" VERBATIM)
+add_custom_target(laya-vulkan-pack-qkv DEPENDS "${laya_pack_header}")
+add_dependencies(ggml-vulkan laya-vulkan-pack-qkv)
+laya_vk_replace("#include \"ggml-vulkan-shaders.hpp\""
+  "#include \"ggml-vulkan-shaders.hpp\"\nstatic const uint32_t laya_pack_qkv_spv[] =\n#include \"laya_pack_qkv.spv.h\"\n;")
+laya_vk_replace("    vk_pipeline pipeline_norm_f32;"
+  "    vk_pipeline pipeline_norm_f32;\n    vk_pipeline pipeline_laya_pack_qkv;")
+laya_vk_replace("    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,"
+  "    ggml_vk_create_pipeline(device, device->pipeline_laya_pack_qkv, \"laya_pack_qkv\", sizeof(laya_pack_qkv_spv), laya_pack_qkv_spv, \"main\", 4, 16, {256,1,1}, {}, 1);\n    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,")
+
+set(laya_pad16_header "${CMAKE_CURRENT_BINARY_DIR}/laya_pad16.spv.h")
+add_custom_command(OUTPUT "${laya_pad16_header}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -mfmt=c
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/pad16.comp" -o "${laya_pad16_header}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/pad16.comp" VERBATIM)
+add_custom_target(laya-vulkan-pad16 DEPENDS "${laya_pad16_header}")
+add_dependencies(ggml-vulkan laya-vulkan-pad16)
+laya_vk_replace("#include \"ggml-vulkan-shaders.hpp\""
+  "#include \"ggml-vulkan-shaders.hpp\"\nstatic const uint32_t laya_pad16_spv[] =\n#include \"laya_pad16.spv.h\"\n;")
+laya_vk_replace("    vk_pipeline pipeline_norm_f32;"
+  "    vk_pipeline pipeline_norm_f32;\n    vk_pipeline pipeline_laya_pad16;")
+laya_vk_replace("    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,"
+  "    ggml_vk_create_pipeline(device, device->pipeline_laya_pad16, \"laya_pad16\", sizeof(laya_pad16_spv), laya_pad16_spv, \"main\", 2, 16, {256,1,1}, {}, 1);\n    ggml_vk_create_pipeline(device, device->pipeline_norm_f32,")

@@ -1,0 +1,111 @@
+From 79e7983997a1c1a7a4ff75903fb65d5abf2e76ad Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 17:56:09 +0100
+Subject: [PATCH 03/30] capi 1.0.2: restore caller FP state via registers; CPU
+ check after argument validation
+
+MinGW's fenv functions did not restore the x87 control word on real Windows
+(seen under Windows-on-ARM x64 emulation). Save/restore with fnstenv/fldenv and
+stmxcsr/ldmxcsr directly; MSVC x64 handles MXCSR only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt |  2 +-
+ capi/laya_c.cpp     | 40 +++++++++++++++++++++++++++++-----------
+ 2 files changed, 30 insertions(+), 12 deletions(-)
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index cebabb0..7f3acf4 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ # Flat C ABI shared library over laya.cpp: laya.dll (Windows), liblaya.so (Linux), liblaya.dylib (macOS).
+ # Enable from the top level with -DLAYA_C_API=ON. Build ggml statically (-DBUILD_SHARED_LIBS=OFF)
+ # to get a single self-contained library.
+-set(LAYA_C_VERSION "1.0.0" CACHE STRING "Version string reported by laya_version()")
++set(LAYA_C_VERSION "1.0.2" CACHE STRING "Version string reported by laya_version()")
+ 
+ add_library(laya_c SHARED laya_c.cpp)
+ target_include_directories(laya_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index 5b3de48..be39e73 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -17,8 +17,12 @@
+ #include <string>
+ #include <thread>
+ #ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
+ #define NOMINMAX
++#endif
+ #include <windows.h>
+ #endif
+ #if defined(__x86_64__) || defined(_M_X64)
+@@ -52,18 +56,31 @@ thread_local std::string last_error;
+ // feholdexcept covers x87 everywhere, but MinGW's version leaves the SSE control register (MXCSR)
+ // unmasked, and SSE is what ggml uses on x86-64, so MXCSR is handled explicitly.
+ struct fp_guard {
+-    std::fenv_t saved;
+-#if defined(__x86_64__) || defined(_M_X64)
+-    unsigned int saved_csr;
+-    fp_guard() : saved_csr(_mm_getcsr()) {
+-        std::feholdexcept(&saved);
+-        _mm_setcsr((saved_csr | 0x1F80u) & ~0x3Fu);  // mask all six exceptions, clear flags
++#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
++    // Save and restore the registers directly rather than through <cfenv>: MinGW's fenv
++    // functions go through the C runtime, and on real Windows they did not restore the
++    // caller's x87 control word.
++    unsigned char x87[28];  // FNSTENV image: control word, status word (flags), tags, pointers
++    unsigned int csr;
++    fp_guard() {
++        __asm__ volatile("fnstenv %0" : "=m"(x87));  // also masks all x87 exceptions
++        __asm__ volatile("fnclex");
++        __asm__ volatile("stmxcsr %0" : "=m"(csr));
++        unsigned int masked = (csr | 0x1F80u) & ~0x3Fu;  // mask all six SSE exceptions, clear flags
++        __asm__ volatile("ldmxcsr %0" : : "m"(masked));
+     }
+     ~fp_guard() {
+-        std::fesetenv(&saved);
+-        _mm_setcsr(saved_csr);
++        __asm__ volatile("fnclex");  // drop flags raised while masked so restoring cannot trap
++        __asm__ volatile("fldenv %0" : : "m"(x87));
++        __asm__ volatile("ldmxcsr %0" : : "m"(csr));
+     }
++#elif defined(_M_X64)
++    // MSVC x64 code uses SSE only; MXCSR is the whole floating-point state.
++    unsigned int csr;
++    fp_guard() : csr(_mm_getcsr()) { _mm_setcsr((csr | 0x1F80u) & ~0x3Fu); }
++    ~fp_guard() { _mm_setcsr(csr); }
+ #else
++    std::fenv_t saved;
+     fp_guard() { std::feholdexcept(&saved); }
+     ~fp_guard() { std::fesetenv(&saved); }
+ #endif
+@@ -262,9 +279,6 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+     last_error.clear();
+     install_hooks();
+     try {
+-        if (const auto missing = missing_cpu_features(); !missing.empty())
+-            throw std::runtime_error("This laya build needs CPU instructions your processor (or virtual machine) "
+-                                     "does not provide: " + missing + ". Use a build for an older CPU baseline.");
+         if (!model_dir || !*model_dir) throw std::invalid_argument("model_dir is empty");
+         const auto options = options_json && *options_json ? laya::json::parse(options_json) : laya::json::object();
+         if (!options.is_object()) throw std::invalid_argument("options_json must be a JSON object");
+@@ -304,6 +318,10 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+         const bool tensor_core = options.value("tensor_core", false);
+         const bool allow_truncation = options.value("allow_truncation", false);
+ 
++        // Checked after the arguments so that bad input is reported as such.
++        if (const auto missing = missing_cpu_features(); !missing.empty())
++            throw std::runtime_error("This laya build needs CPU instructions your processor (or virtual machine) "
++                                     "does not provide: " + missing + ". Use a build for an older CPU baseline.");
+         static std::mutex create_lock;  // set_cpu_threads is process-wide; keep creation atomic
+         std::lock_guard<std::mutex> guard(create_lock);
+         laya::set_cpu_threads(threads ? threads : int(std::max(1u, std::thread::hardware_concurrency())));
+-- 
+2.43.0
+

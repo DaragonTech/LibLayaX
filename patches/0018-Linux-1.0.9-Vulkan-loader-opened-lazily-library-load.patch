@@ -1,0 +1,168 @@
+From b945d8a220c19b3b79c5d109881fea867f869e44 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 22:08:08 +0100
+Subject: [PATCH 18/30] Linux 1.0.9: Vulkan loader opened lazily (library loads
+ without Vulkan); tools in all builds
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LAsYHSSgSysMFa8MKPJWgL
+---
+ capi/CMakeLists.txt         |  6 +++++
+ capi/laya_c.cpp             | 10 ++++++++
+ capi/vulkan_lazy.c          | 51 +++++++++++++++++++++++++++++++++++++
+ scripts/capi/build-linux.sh | 15 ++++++++---
+ 4 files changed, 78 insertions(+), 4 deletions(-)
+ create mode 100644 capi/vulkan_lazy.c
+
+diff --git a/capi/CMakeLists.txt b/capi/CMakeLists.txt
+index 08fad69..7cad557 100644
+--- a/capi/CMakeLists.txt
++++ b/capi/CMakeLists.txt
+@@ -9,6 +9,12 @@ target_link_libraries(laya_c PRIVATE laya)
+ target_compile_features(laya_c PRIVATE cxx_std_20)
+ target_compile_definitions(laya_c PRIVATE LAYA_C_VERSION="${LAYA_C_VERSION}"
+   $<$<BOOL:${LAYA_CUDA}>:LAYA_CUDA=1> $<$<BOOL:${LAYA_VULKAN}>:LAYA_VULKAN=1>)
++# Linux Vulkan builds can open the system Vulkan loader lazily (pass the shim as Vulkan_LIBRARY, see
++# scripts/capi/build-linux.sh); the library then loads on machines without Vulkan.
++option(LAYA_VULKAN_LAZY "Vulkan_LIBRARY is the lazy-loading shim (capi/vulkan_lazy.c)" OFF)
++if(LAYA_VULKAN_LAZY)
++  target_compile_definitions(laya_c PRIVATE LAYA_VULKAN_LAZY=1)
++endif()
+ # Tell the library which instruction-set baseline ggml was compiled for, so it can refuse to load
+ # with a clear message on an older CPU instead of crashing on an illegal instruction.
+ foreach(feature AVX AVX2 FMA F16C BMI2 AVX512F)
+diff --git a/capi/laya_c.cpp b/capi/laya_c.cpp
+index 0bab728..8dd223e 100644
+--- a/capi/laya_c.cpp
++++ b/capi/laya_c.cpp
+@@ -41,6 +41,10 @@
+ #define LAYA_C_VERSION "1.0.0"
+ #endif
+ 
++#if defined(__linux__) && defined(LAYA_VULKAN_LAZY)
++extern "C" int laya_vulkan_loader_available(void);
++#endif
++
+ struct laya_agent {
+     laya::agent impl;
+     std::mutex lock;
+@@ -350,6 +354,12 @@ LAYA_API laya_agent* LAYA_CALL laya_create(const char* model_dir, const char* op
+                 throw std::runtime_error("Vulkan is not available: put libMoltenVK.dylib next to liblaya.dylib, "
+                                          "or use the cpu backend");
+ #endif
++#if defined(__linux__) && defined(LAYA_VULKAN_LAZY)
++            // liblaya.so opens libvulkan.so.1 on first use (capi/vulkan_lazy.c) rather than linking it.
++            if (!laya_vulkan_loader_available())
++                throw std::runtime_error("Vulkan is not installed on this computer (libvulkan.so.1 not found); "
++                                         "install the GPU driver and Vulkan loader, or use the cpu backend");
++#endif
+ #if defined(_WIN32) && defined(LAYA_VULKAN)
+             // laya.dll delay-loads vulkan-1.dll (installed with GPU drivers), so the library and the
+             // CPU backend work on machines without it; check before anything touches Vulkan.
+diff --git a/capi/vulkan_lazy.c b/capi/vulkan_lazy.c
+new file mode 100644
+index 0000000..3fe82cb
+--- /dev/null
++++ b/capi/vulkan_lazy.c
+@@ -0,0 +1,51 @@
++/* vulkan_lazy.c - load the Vulkan loader on first use instead of at library load (Linux).
++ *
++ * ggml's Vulkan backend resolves almost everything through vkGetInstanceProcAddr and links only
++ * the four functions below directly. Linking libvulkan.so.1 normally would make liblaya.so refuse
++ * to load on machines without Vulkan; with this shim linked in its place (as Vulkan_LIBRARY) the
++ * library always loads, the cpu backend always works, and laya_create reports a clear error for
++ * the vulkan backend when the loader is missing (see laya_vulkan_loader_available).
++ */
++#include <dlfcn.h>
++#include <pthread.h>
++#include <stddef.h>
++#include <vulkan/vulkan.h>
++
++static void* library;
++static pthread_once_t once = PTHREAD_ONCE_INIT;
++static void open_library(void) {
++    library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_GLOBAL);
++    if (!library) library = dlopen("libvulkan.so", RTLD_NOW | RTLD_GLOBAL);
++}
++static void* symbol(const char* name) {
++    pthread_once(&once, open_library);
++    return library ? dlsym(library, name) : NULL;
++}
++
++/* 1 if the system Vulkan loader can be opened. */
++int laya_vulkan_loader_available(void) {
++    pthread_once(&once, open_library);
++    return library != NULL;
++}
++
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* name) {
++    static PFN_vkGetInstanceProcAddr real;
++    if (!real) real = (PFN_vkGetInstanceProcAddr)symbol("vkGetInstanceProcAddr");
++    return real ? real(instance, name) : NULL;
++}
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char* name) {
++    static PFN_vkGetDeviceProcAddr real;
++    if (!real) real = (PFN_vkGetDeviceProcAddr)symbol("vkGetDeviceProcAddr");
++    return real ? real(device, name) : NULL;
++}
++VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDevice device, VkPhysicalDeviceFeatures2* features) {
++    static PFN_vkGetPhysicalDeviceFeatures2 real;
++    if (!real) real = (PFN_vkGetPhysicalDeviceFeatures2)symbol("vkGetPhysicalDeviceFeatures2");
++    if (real) real(device, features);
++}
++VKAPI_ATTR void VKAPI_CALL vkCmdCopyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destination,
++                                           uint32_t count, const VkBufferCopy* regions) {
++    static PFN_vkCmdCopyBuffer real;
++    if (!real) real = (PFN_vkCmdCopyBuffer)symbol("vkCmdCopyBuffer");
++    if (real) real(commands, source, destination, count, regions);
++}
+diff --git a/scripts/capi/build-linux.sh b/scripts/capi/build-linux.sh
+index c7f0631..cdd3adf 100755
+--- a/scripts/capi/build-linux.sh
++++ b/scripts/capi/build-linux.sh
+@@ -9,7 +9,8 @@
+ #
+ #   scripts/capi/build-linux.sh            # build both
+ #   VARIANTS=compat scripts/capi/build-linux.sh
+-#   VARIANTS=vulkan EXTRA_CMAKE_ARGS="-DVulkan_GLSLC_EXECUTABLE=/path/to/glslc -DVulkan_INCLUDE_DIR=..." ...
++#   VARIANTS=vulkan VULKAN_HEADERS=/path/to/Vulkan-Headers/include \
++#     EXTRA_CMAKE_ARGS="-DVulkan_GLSLC_EXECUTABLE=/path/to/glslc -DVulkan_INCLUDE_DIR=..." ...
+ #     (Ubuntu 24.04's glslc 2023.8 crashes on laya's shaders; use shaderc >= 2025.3 / Vulkan SDK 1.4)
+ #
+ # Needs: cmake ninja-build g++ nlohmann-json3-dev curl
+@@ -20,7 +21,7 @@ ICU_VERSION=${ICU_VERSION:-76-1}
+ ICU_TGZ=icu4c-${ICU_VERSION/-/_}-src.tgz
+ JOBS=${JOBS:-$(nproc)}
+ VARIANTS=${VARIANTS:-"avx2 compat"}
+-VERSION=${LAYA_C_VERSION:-1.0.5}
++VERSION=${LAYA_C_VERSION:-1.0.9}
+ mkdir -p "$WORK" && cd "$WORK"
+ 
+ # 1. Static, position-independent ICU (the system one is a shared, version-specific library).
+@@ -45,7 +46,13 @@ for variant in $VARIANTS; do
+     compat) isa=(-DGGML_SSE42=ON -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF) ;;
+     # GPU through Vulkan (needs libvulkan-dev glslc spirv-headers to build, a Vulkan driver to run);
+     # its CPU fallback backend uses the avx2 baseline.
+-    vulkan) isa=(-DLAYA_VULKAN=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON) ;;
++    vulkan) # libvulkan.so.1 is opened on first use through a small shim, not linked: the library
++            # then loads (and the cpu backend works) on machines without Vulkan.
++            mkdir -p "$WORK/vulkan-lazy"
++            ${CC:-cc} -O2 -fPIC -I"${VULKAN_HEADERS:-/usr/include}" -c "$ROOT/capi/vulkan_lazy.c" -o "$WORK/vulkan-lazy/vulkan_lazy.o"
++            rm -f "$WORK/vulkan-lazy/libvulkan_lazy.a" && ar rcs "$WORK/vulkan-lazy/libvulkan_lazy.a" "$WORK/vulkan-lazy/vulkan_lazy.o"
++            isa=(-DLAYA_VULKAN=ON -DLAYA_VULKAN_LAZY=ON -DVulkan_LIBRARY="$WORK/vulkan-lazy/libvulkan_lazy.a"
++                 -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON) ;;
+     *) echo "unknown variant $variant" >&2; exit 1 ;;
+   esac
+   cmake -S "$ROOT" -B "$ROOT/build-linux-$variant" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+@@ -56,7 +63,7 @@ for variant in $VARIANTS; do
+     -DCMAKE_CXX_FLAGS="-DU_STATIC_IMPLEMENTATION" \
+     -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
+     -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" ${EXTRA_CMAKE_ARGS:-}
+-  cmake --build "$ROOT/build-linux-$variant" --parallel "$JOBS" --target laya_c test-capi laya-cli
++  cmake --build "$ROOT/build-linux-$variant" --parallel "$JOBS" --target laya_c test-capi laya-cli laya-bench laya-diag laya-trace
+   strip --strip-unneeded "$ROOT/build-linux-$variant/bin/liblaya.so"
+   echo "== $variant: $ROOT/build-linux-$variant/bin/liblaya.so"
+   readelf -d "$ROOT/build-linux-$variant/bin/liblaya.so" | grep NEEDED
+-- 
+2.43.0
+

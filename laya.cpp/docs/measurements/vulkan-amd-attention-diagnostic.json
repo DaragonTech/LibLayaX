@@ -1,0 +1,363 @@
+{
+  "schema_version": 1,
+  "scope": "Experimental English FP16 AMD attention diagnostic; not a full correctness gate or performance result.",
+  "gpu": "AMD Radeon 8060S Graphics",
+  "case": "delivery-01",
+  "tokens": 184,
+  "torch": "2.11.0+rocm7.13",
+  "matched_tensor_count": 238,
+  "tensor_elements": 87283712,
+  "fp16_boundary_tensors": 30,
+  "tensor_manifest_sha256": "744cb5da92efe27751f4460f1e790f696b2d56bdbd44431962e81ecd0877b89b",
+  "artifacts": {
+    "oracle_sha256": "2d5636ca7977859d0bab6ba3916231b5ee0b895d5d43f35e4891e2a03646d55d",
+    "tiled_shader_sha256": "fb229fc8aafc2b71b4fc86f78ded0f461ce07f415dc9cea995c2ac78489da05f",
+    "backend_sha256": "a8ef4ca8c894f86b87cf9c9a6e47433245186f411421c8722afaf1858f93aedb",
+    "runtime_sha256": "fbd4628f677521bbe80395cbd8c39f5680c0799375f8a0c4353925391e929c9d"
+  },
+  "english_fp16_full_gates": [
+    {
+      "prototype": "pv-order",
+      "report_sha256": "5f3ea3bc0fe163581008a237735c71606d56f242182eaebf5eca457202cd1ebf",
+      "native_build_sha256": "d0e921af6f22bf0248feee634f7b0faf15d8d52df76d38943bee1781c4cd2335",
+      "passed": false,
+      "batches": [
+        {
+          "batch_size": 1,
+          "questions": 250,
+          "answer_failures": 1
+        },
+        {
+          "batch_size": 2,
+          "questions": 250,
+          "answer_failures": 2
+        },
+        {
+          "batch_size": 4,
+          "questions": 250,
+          "answer_failures": 30
+        },
+        {
+          "batch_size": 8,
+          "questions": 250,
+          "answer_failures": 45
+        }
+      ]
+    },
+    {
+      "prototype": "pv-tiled",
+      "report_sha256": "1c7976c7faece2ee137f9fb4da761f2dafee2c32c9dd75f01f2bec3fb7444220",
+      "native_build_sha256": "983fc25c7daf672f23514f9ba3e519fd18f47f892dc87928d86f8f8b13340bda",
+      "passed": false,
+      "batches": [
+        {
+          "batch_size": 1,
+          "questions": 250,
+          "answer_failures": 1
+        },
+        {
+          "batch_size": 2,
+          "questions": 250,
+          "answer_failures": 2
+        },
+        {
+          "batch_size": 4,
+          "questions": 250,
+          "answer_failures": 30
+        },
+        {
+          "batch_size": 8,
+          "questions": 250,
+          "answer_failures": 45
+        }
+      ]
+    }
+  ],
+  "scorer_diagnostic": {
+    "case": "accessibility-05",
+    "tokens": 102,
+    "passed": true,
+    "scope": "Single-case full trace comparison, including all four scorer stages, at matching storage boundaries.",
+    "change": "Use the matrix pipeline for low-precision AMD products with more than one input column and at least 64 output rows.",
+    "backend_sha256": "11a0e8b8471be639ad82d82bb0d41f3e4dc692068f149636b247e0fedaa6403c",
+    "runtime_sha256": "9cd48f34a07d5bd82e885ab52976f19a90241abd6d508021bd869acb40149ba0"
+  },
+  "scorer_full_gate": {
+    "report_sha256": "f9138f20e8c94f18a58a4995df2ed2a4afa596cc33663214a83dd6a9e5a85008",
+    "native_build_sha256": "69878fc13394bce7e088501509c0534dbc00c7aef1cc208ffc4da08d57c90195",
+    "passed": false,
+    "batches": [
+      {
+        "batch_size": 1,
+        "questions": 250,
+        "answer_failures": 0
+      },
+      {
+        "batch_size": 2,
+        "questions": 250,
+        "answer_failures": 1
+      },
+      {
+        "batch_size": 4,
+        "questions": 250,
+        "answer_failures": 30
+      },
+      {
+        "batch_size": 8,
+        "questions": 250,
+        "answer_failures": 45
+      }
+    ]
+  },
+  "batched_head_diagnostic": {
+    "case_ids": [
+      "data_pipeline-05",
+      "data_pipeline-06"
+    ],
+    "batch_size": 2,
+    "sequence_length": 89,
+    "first_divergence": "head.layers.0.attn.Wqkv",
+    "checks": [
+      {
+        "layer": 0,
+        "norm_input_differences": 0,
+        "norm_input_fp16_differences": 0,
+        "separate_bias_vs_actual_differences": 0,
+        "native_vs_actual_differences": 2654,
+        "native_vs_separate_bias_differences": 2654
+      },
+      {
+        "layer": 1,
+        "norm_input_differences": 178631,
+        "norm_input_fp16_differences": 5887,
+        "separate_bias_vs_actual_differences": 0,
+        "native_vs_actual_differences": 39392,
+        "native_vs_separate_bias_differences": 39392
+      }
+    ],
+    "finding": "The first head normalized input and separate bias addition match. The actual Python head projection uses a batched GEMM kernel with SU32/SUS256, distinct from the flattened projection policy.",
+    "all_matrix_selector_fixed_answer": false,
+    "artifact_sha256": {
+      "research/amd-fp16-b2-bias-check.json": "87462f359aef98048d3b893f46924bdd8e61bbf81777cd872d305f31f9fcce00",
+      "research/amd-fp16-b2-head-kernels.json": "5fe574e3bc21d86a5c2b27a958b1b01a4d3f4414d4e99acfaa4e8506a3d2ead2"
+    }
+  },
+  "batched_head_layout_prototype": {
+    "model": "english",
+    "precision": "fp16",
+    "isolated_case_ids": [
+      "data_pipeline-05",
+      "data_pipeline-06"
+    ],
+    "isolated_comparison": "Differing tensors 0",
+    "full_corpus_passed": false,
+    "batches": [
+      {
+        "batch_size": 1,
+        "questions": 250,
+        "answer_failures": 0
+      },
+      {
+        "batch_size": 2,
+        "questions": 250,
+        "answer_failures": 1
+      },
+      {
+        "batch_size": 4,
+        "questions": 250,
+        "answer_failures": 28
+      },
+      {
+        "batch_size": 8,
+        "questions": 250,
+        "answer_failures": 46
+      }
+    ],
+    "validation_report_sha256": "bff37d84856d5d76eb70254ba36a020c56035688b8439b8a614852209ea08d39",
+    "scope": "Diagnostic prototype only; full correctness acceptance has not passed."
+  },
+  "batch4_projection_diagnostic": {
+    "case_ids": [
+      "leave-09",
+      "leave-10",
+      "expense-01",
+      "expense-02"
+    ],
+    "batch_size": 4,
+    "sequence_length": 512,
+    "projection_columns": 2048,
+    "measured_policy_max_columns": 1024,
+    "finding": "Both precisions first diverge in encoder QKV. Python selects SU32/SUS256 while the prototype policy has no coverage above 1024 columns. Extended profiling is pending; this identifies a discrepancy, not a proven complete fix.",
+    "precisions": {
+      "bf16": {
+        "first_difference": {
+          "name": "encoder.layers.0.attn.Wqkv",
+          "numerical_differences": 4556,
+          "bit_differences": 4556,
+          "max_error": 0.015625
+        },
+        "comparison_sha256": "87e4aeb32c7534a95a39b7d54c051064af05e6bac3cdb6cdf7ceabf8218311a3",
+        "python_profile_sha256": "b92f3bf9b064c7135379fd8ca7d7648951d067d48e74d8f9912b6d8843977639"
+      },
+      "fp16": {
+        "first_difference": {
+          "name": "encoder.layers.0.attn.Wqkv",
+          "numerical_differences": 64258,
+          "bit_differences": 64258,
+          "max_error": 0.001953125
+        },
+        "comparison_sha256": "2c6216795bfd131e5d47c9c27e4a73fe3579a9129d7b597c843ce4f859af6c2a",
+        "python_profile_sha256": "c649caee9188df5a36e83dfc2d2e9cae66e95918dd2cefd4a5920d99a9027478"
+      }
+    }
+  },
+  "extended_projection_policy_diagnostic": {
+    "measured_projection_rows": 163840,
+    "maximum_projection_columns": 4096,
+    "policy_intervals": 110,
+    "scope": "Experimental AMD backend; public-answer equality on one four-request group is not full-model acceptance.",
+    "precisions": {
+      "bf16": {
+        "exact_public_answers": 4,
+        "first_remaining_trace_difference": {
+          "name": "encoder.layers.1.attn.Wo.input",
+          "numerical_differences": 766976,
+          "bit_differences": 766976,
+          "max_error": 1.1953125
+        },
+        "response_sha256": "b62477c6e4b23f89ba05247e154f014e92c971b7ced96c5341dc1312da1fda80",
+        "trace_comparison_sha256": "367e33c30da12fdcefafea108e5f137346d5fc5de4d0824ac6c7d221fd2346cb"
+      },
+      "fp16": {
+        "exact_public_answers": 4,
+        "first_remaining_trace_difference": {
+          "name": "encoder.layers.1.attn.Wo.input",
+          "numerical_differences": 766976,
+          "bit_differences": 766976,
+          "max_error": 1.19140625
+        },
+        "response_sha256": "1e8247c1502629049a943fe75bbfa03c345e324cba5112e0a1295c9215acaa7d",
+        "trace_comparison_sha256": "0561e091faa04a7bc4687145b588a707b9f0f5f40db3bfcc302c6ffa191f889c"
+      }
+    },
+    "first_attention_difference_locations": {
+      "tensor": "encoder.layers.1.attn.Wo.input",
+      "applies_to_precisions": [
+        "bf16",
+        "fp16"
+      ],
+      "sequence_lengths": [
+        73,
+        74,
+        512,
+        512
+      ],
+      "differing_query_ranges_inclusive": [
+        [
+          137,
+          511
+        ],
+        [
+          138,
+          511
+        ],
+        null,
+        null
+      ],
+      "differing_valid_query_positions": 0,
+      "scope": "Only the first differing attention tensor was checked by query position; later trace differences still require separate interpretation."
+    }
+  },
+  "accessibility_batched_scalar_diagnostic": {
+    "case_ids": [
+      "accessibility-05",
+      "accessibility-06"
+    ],
+    "precision": "fp16",
+    "first_and_only_common_trace_difference": {
+      "name": "scorer.3",
+      "numerical_differences": 1,
+      "bit_differences": 1,
+      "max_error": 0.0009765625
+    },
+    "python_kernel": "Scalar FMA MT128x32x16, MIAV0, GSU1, SU32/SUS256",
+    "cpu_replay": {
+      "ascending_f32_fma_stored_fp16_differences": 0,
+      "descending_f32_fma_stored_fp16_differences": 0,
+      "values": 10
+    },
+    "replay_sha256": "7682323282335c96b2098c8b29acafa4d84c48be440f2b45e1f30aa040604b97",
+    "scope": "CPU replay of the final scoring projection only; native scalar shader remains unverified."
+  },
+  "sequential_scalar_gpu_diagnostic": {
+    "precision": "fp16",
+    "case_ids": [
+      "accessibility-05",
+      "accessibility-06"
+    ],
+    "common_trace_differences": 0,
+    "comparison_sha256": "d6678343aa22310968b215e549fbc8e55b62c8873ef23dca1f31fe229527817f",
+    "change": "Bypass both vector-dispatch shortcuts for eligible scalar projections and accumulate in ascending K order with FP32 FMA.",
+    "scope": "Isolated experimental GPU result; all-model validation pending."
+  },
+  "bf16_batched_head_gpu_diagnostic": {
+    "change": "Preserve the head projection batch dimension for BF16 as well as FP16.",
+    "groups": [
+      {
+        "group": "expense",
+        "batch_size": 4,
+        "exact_public_answers": 4,
+        "common_trace_differences": 0,
+        "comparison_sha256": "d6678343aa22310968b215e549fbc8e55b62c8873ef23dca1f31fe229527817f",
+        "response_sha256": "348de9910e8ebd084f9ed73f046025e0982053e6c444b0da9cbf0d47503c0317"
+      },
+      {
+        "group": "quoted",
+        "batch_size": 4,
+        "exact_public_answers": 4,
+        "common_trace_differences": 0,
+        "comparison_sha256": "d6678343aa22310968b215e549fbc8e55b62c8873ef23dca1f31fe229527817f",
+        "response_sha256": "d18576fe592d8b7e746ee0ac35c4161dbfad8b48ed68c0743f0404a5674dee73"
+      }
+    ],
+    "scope": "Two isolated experimental groups; all-model acceptance pending."
+  },
+  "bf16_sequential_scalar_gpu_diagnostic": {
+    "case_ids": [
+      "quoted_content-01",
+      "quoted_content-02",
+      "quoted_content-03",
+      "quoted_content-04",
+      "quoted_content-05",
+      "quoted_content-06",
+      "quoted_content-07",
+      "quoted_content-08"
+    ],
+    "batch_size": 8,
+    "exact_public_answers": 8,
+    "common_trace_differences": 0,
+    "comparison_sha256": "d6678343aa22310968b215e549fbc8e55b62c8873ef23dca1f31fe229527817f",
+    "response_sha256": "b8958b752e1fb92af8cd64b56993ca313efa1e714045dae864564e001bdcc21d",
+    "scope": "Experimental BF16 scalar F32 accumulation; whole-corpus validation of this revision is pending."
+  },
+  "multilingual_strict_normalization_diagnostic": {
+    "precision": "bf16",
+    "case_ids": [
+      "billing-01"
+    ],
+    "normalization_width": 768,
+    "comparable_trace_tensors": 194,
+    "python_trace_tensors": 316,
+    "common_trace_differences": 0,
+    "exact_public_answers": 1,
+    "changes": [
+      "Match AMD weighted-mean FMA operand ordering.",
+      "Preserve all 11 explicit normalization FMA instructions with SPIR-V NoContraction.",
+      "Extend measured projection traversal coverage through 8192 columns."
+    ],
+    "comparison_sha256": "d6678343aa22310968b215e549fbc8e55b62c8873ef23dca1f31fe229527817f",
+    "response_sha256": "7daa59ebff86ee43f3547499153e736e404b91641494c07b424cc4f1f8b7816c",
+    "normalization_spirv_header_sha256": "212c4d84b15a14287a5bb9acb319aa345ba9d78b235944e5498f9921aff3f2d1",
+    "scope": "Isolated experimental multilingual result; full three-model BF16/FP16 validation is running."
+  }
+}

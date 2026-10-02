@@ -1,0 +1,16 @@
+; Exports of laya.dll. An import library for Visual C++ can be made from this file with
+;   lib /def:laya.def /machine:x64 /out:laya.lib        (or /machine:arm64)
+; or, without Visual Studio,
+;   llvm-dlltool -m i386:x86-64 -d laya.def -D laya.dll -l laya.lib   (or -m arm64)
+LIBRARY laya.dll
+EXPORTS
+    laya_api_version
+    laya_create
+    laya_destroy
+    laya_free_string
+    laya_info
+    laya_last_error
+    laya_predict
+    laya_prepare
+    laya_set_log_callback
+    laya_version
