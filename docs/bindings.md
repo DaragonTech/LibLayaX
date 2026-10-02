@@ -46,9 +46,12 @@ print(answer.results[1].answers.refund.noul)
 ```
 
 How far each has been tested is stated in its own README. In short: DLaya has run with the
-real model on Windows x64 and has been compiled with Free Pascal but not yet with Embarcadero
-Delphi; RLaya has been built and tested on Linux only; LLaya has run with the real model on
-Windows ARM64, Windows x64 (under emulation on Windows on ARM), macOS and Linux ARM64.
+real model on Windows x64, on the CPU and on the GPU, built with Delphi 10.2 and with Free
+Pascal; RLaya has run with the real model on
+Windows x64, Windows ARM64, Linux x86-64, Linux ARM64 and macOS, on the CPU and, on Windows
+x64 and macOS, on the GPU; LLaya has run with the real model on
+Windows x64, Windows ARM64, macOS and Linux ARM64, on the CPU and, on Windows x64 and macOS,
+on the GPU.
 
 ## Any other language
 

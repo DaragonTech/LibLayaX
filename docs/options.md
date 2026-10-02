@@ -157,7 +157,7 @@ Two settings of the engine's GPU code that rarely need touching.
 | Server shared with other work | `{"backend":"cpu","threads":4}` |
 | Texts of unknown length, an answer wanted in every case | add `"allow_truncation":true` |
 
-Of the GPUs, an NVIDIA RTX 5080 (Windows) and an Apple M3 Ultra (macOS) are the ones the
-library has actually been run on. `laya-diag`, in every package, compares the GPU's answers
+The GPUs the library has actually been run on are an NVIDIA RTX 5080 Laptop GPU and an NVIDIA
+GeForce RTX 3050 (both on Windows) and an Apple M3 Ultra (macOS). `laya-diag`, in every package, compares the GPU's answers
 with the CPU's on your machine; run it once before relying on a GPU you have not used before
 ([Testing](testing.md)).

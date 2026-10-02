@@ -137,21 +137,27 @@ hardware, with the real English model.
 |---|---|---|
 | Windows x64 `avx2`, `compat-sse42` | 1.0.5 | Intel Core Ultra 9 275HX |
 | Windows x64 `vulkan`, on the GPU | 1.0.6 | NVIDIA RTX 5080 Laptop GPU |
-| Windows x64 `compat-sse42` | 1.0.9 | Windows 11 on ARM, x64 emulation (Parallels) |
+| Windows x64 `vulkan` package, on the CPU and on the GPU (full precision) | 1.0.14 | Intel Core Ultra 9 275HX with NVIDIA RTX 5080 Laptop GPU (through the Lua binding's test suite, and through the Delphi binding's test program built with Delphi 10.2) |
+| Windows x64 `vulkan` package, on the CPU and on the GPU (full precision) | 1.0.14 | AMD Ryzen 5 5500 with NVIDIA GeForce RTX 3050 (through the Rust binding's tests) |
+| Windows x64 `compat-sse42` | 1.0.14 | Windows 11 on ARM, x64 emulation (Parallels), through the Lua and Rust bindings' tests |
 | Windows ARM64 | 1.0.14 | Windows 11 on ARM (Parallels on Apple M3 Ultra) |
+| Linux x86-64 `compat-sse42` | 1.0.14 | Ubuntu 26.04 LTS (VMware virtual machine on an AMD Ryzen 5 5500), through the Rust binding's tests |
+| Linux x86-64 `vulkan`, on its CPU backend | 1.0.14 | Ubuntu 24.04.5 LTS under WSL on Windows, AMD Ryzen 5 5500, through the Rust binding's tests |
 | Linux ARM64 | 1.0.14 | Ubuntu 24.04 ARM64 (Parallels on Apple Silicon) |
 | macOS arm64, CPU | 1.0.5 | Apple M3 Ultra |
 | macOS arm64, on the GPU | 1.0.9 | Apple M3 Ultra |
-| macOS arm64, GPU package on its CPU backend | 1.0.14 | Apple M3 Ultra (through the Lua binding's test suite) |
+| macOS arm64, GPU package, on the CPU and on the GPU (full precision) | 1.0.14 | Apple M3 Ultra (through the Lua and Rust bindings' tests) |
 
 Run only on the build machine, with a synthetic model (the real architecture with random
-weights): Linux x86-64, all three folders, the `vulkan` one on its CPU backend.
+weights): the Linux x86-64 `avx2` folder.
 
 Not run anywhere yet:
 
 * the macOS Intel builds;
-* the GPU backend on Linux;
-* AMD and Intel GPUs on any system;
+* the GPU backend on Linux, on a GPU. It was tried under WSL (Ubuntu 24.04 on a machine with
+  an RTX 3050), where Vulkan offers no GPU: the library reported `No usable Vulkan GPU found`
+  and the CPU backend worked;
+* AMD and Intel GPUs on any system (the GPUs that have run are NVIDIA and Apple ones);
 * a build with Visual C++, and the CUDA backend;
 * the `multilingual` and `typed-decisions` models.
 

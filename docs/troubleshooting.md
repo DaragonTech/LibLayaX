@@ -36,7 +36,7 @@ and the backends in that file.
 | `This build has no Vulkan backend` | A GPU was asked of a CPU-only library. | Use a `vulkan` package. |
 | `Vulkan is not installed on this computer (…)` | No Vulkan loader on the system. | Install or update the GPU driver, or use `"backend":"cpu"`. |
 | `Vulkan is not available: put libMoltenVK.dylib next to liblaya.dylib, …` | macOS: the MoltenVK file from the package is missing. | Put it in the same folder as the library. |
-| `No usable Vulkan GPU found` | Vulkan is there but lists no GPU. | Update the driver, or use the CPU. |
+| `No usable Vulkan GPU found` | Vulkan is there but lists no GPU. This is also what Linux under WSL gives: WSL has no native GPU driver for Vulkan, even when the same GPU works from Windows. | Update the driver, or use the CPU. Under WSL, use the CPU backend, or run the Windows library from Windows. |
 | `Vulkan device … does not exist`, `No Vulkan GPU matches "…"` | The `device` option points at a GPU that is not there. | The message lists what was found. |
 | `FP16 currently requires Vulkan`, `BF16 mode requires a GPU; …` | A half precision on the CPU. | Use `fp32` on the CPU. |
 | `This laya build needs CPU instructions your processor (or virtual machine) does not provide: …` | An `avx2` library on a processor without AVX2, or under an emulator. | Use the `compat-sse42` library. |
